@@ -1,0 +1,12 @@
+{
+  "historical_csv": "usgs_historical_events.csv",
+  "period_start": "2026-08-11T00:00:00+00:00",
+  "period_end": "2026-11-09T00:00:00+00:00",
+  "window_hours": 6,
+  "windows_in_period": 360,
+  "events": 32544,
+  "cells": 1887,
+  "regions_with_b_value": 32,
+  "min_region_events": 50,
+  "computed_at": "2026-11-09T01:46:15+00:00"
+}

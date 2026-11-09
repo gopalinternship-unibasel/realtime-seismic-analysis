@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Download USGS history (FDSN event service) and recompute data/baseline/*.csv on the Spark cluster.
 set -euo pipefail
-docker compose up -d postgres spark-master spark-worker-1 spark-worker-2
-docker compose run --rm streaming-job bash -lc 'spark-submit --master ${SPARK_MASTER_URL:-spark://spark-master:7077} src/batch/compute_baselines.py'
+cd "$(dirname "$0")/.."
+docker compose --profile batch run --rm baselines
+cat data/baseline/baseline_metadata.json
+echo "Restart the streaming job to load the new baselines: docker compose --profile app restart streaming-job"
