@@ -583,6 +583,22 @@ def clean_events(raw: DataFrame) -> DataFrame:
     )
 
 
+# How long Spark remembers an event id. USGS revises events for days after they happen, and the
+# live producer backfills the last week, so a duplicate can arrive up to about 7 days later.
+DEDUP_WATERMARK = os.getenv("DEDUP_WATERMARK", "7 days")
+
+
+def prepare_stream(raw: DataFrame) -> DataFrame:
+    """Clean and enrich the parsed records and drop repeated event ids across micro-batches.
+
+    dropDuplicatesWithinWatermark keeps each event id in the streaming state until the
+    event-time watermark has passed it by DEDUP_WATERMARK, so the state stays bounded
+    (plain dropDuplicates on event_id alone would keep every id forever). PostgreSQL's
+    ON CONFLICT (event_id) catches anything older.
+    """
+    return clean_events(raw).withWatermark("event_ts", DEDUP_WATERMARK).dropDuplicatesWithinWatermark(["event_id"])
+
+
 def main() -> int:
     cfg = StreamConfig()
     kafka_config = KafkaConfig()
@@ -619,7 +635,7 @@ def main() -> int:
     )
 
     raw = kafka_raw.select(F.from_json(F.col("value").cast("string"), EVENT_SCHEMA).alias("event")).select("event.*")
-    stream_df = clean_events(raw).withWatermark("event_ts", "7 days").dropDuplicates(["event_id"])
+    stream_df = prepare_stream(raw)
 
     query = (
         stream_df.writeStream.foreachBatch(
