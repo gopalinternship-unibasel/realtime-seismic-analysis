@@ -37,6 +37,9 @@ services:
 
   kafka:
     image: apache/kafka:3.7.1
+    # Give the broker time to flush and close its logs on "docker compose stop" (the default
+    # 10 s ended in SIGKILL, exit 137, and a log recovery on the next start).
+    stop_grace_period: 30s
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
@@ -156,8 +159,9 @@ services:
       MAX_KMEANS_CLUSTERS: ${MAX_KMEANS_CLUSTERS:-5}
       ACTIVE_REGION_HOURS: ${ACTIVE_REGION_HOURS:-24}
       REGION_RADIUS_KM: ${REGION_RADIUS_KM:-300}
+    # exec: spark-submit replaces the shell, so it receives SIGTERM on "docker compose stop".
     command: >
-      bash -lc "sleep 8 && spark-submit --master $${SPARK_MASTER_URL}
+      bash -lc "sleep 8 && exec spark-submit --master $${SPARK_MASTER_URL}
       --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.5,org.postgresql:postgresql:42.7.4
       --conf spark.sql.shuffle.partitions=4
       src/streaming/streaming_job.py"
@@ -217,6 +221,8 @@ services:
       dockerfile: Dockerfile.dashboard
     image: cvfix-seismic-dashboard:latest
     profiles: ["app"]
+    # Python as PID 1 ignores SIGTERM; an init process forwards it so the dashboard stops at once.
+    init: true
     depends_on:
       postgres:
         condition: service_healthy
