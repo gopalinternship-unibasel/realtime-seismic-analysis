@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import math
 import os
 import time
+from collections import Counter
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -39,32 +41,40 @@ from src.streaming.analytics import (
     region_id_expr,
 )
 
-EVENT_SCHEMA = StructType(
-    [
-        StructField("event_id", StringType(), False),
-        StructField("event_time", StringType(), False),
-        StructField("ingestion_time", StringType(), True),
-        StructField("magnitude", DoubleType(), True),
-        StructField("depth_km", DoubleType(), True),
-        StructField("longitude", DoubleType(), True),
-        StructField("latitude", DoubleType(), True),
-        StructField("place", StringType(), True),
-        StructField("event_type", StringType(), True),
-        StructField("status", StringType(), True),
-        StructField("tsunami", IntegerType(), True),
-        StructField("significance", IntegerType(), True),
-        StructField("station_count", IntegerType(), True),
-        StructField("rms", DoubleType(), True),
-        StructField("azimuthal_gap", DoubleType(), True),
-        StructField("felt_count", IntegerType(), True),
-        StructField("url", StringType(), True),
-        StructField("grid_lon", IntegerType(), True),
-        StructField("grid_lat", IntegerType(), True),
-        StructField("cell_id", StringType(), True),
-        StructField("region_id", StringType(), True),
-        StructField("source", StringType(), True),
-    ]
+# Fields of a producer record. Every field is read as text and converted in clean_events(): a
+# numeric field declared as a double in from_json() turned a number sent as text ("3.0") into
+# NULL without a trace, and a value that is no number at all was indistinguishable from a
+# missing one. Now numbers sent as text are accepted, and anything else is rejected with a reason.
+DOUBLE_FIELDS = ("magnitude", "depth_km", "longitude", "latitude", "rms", "azimuthal_gap")
+INT_FIELDS = ("tsunami", "significance", "station_count", "felt_count", "grid_lon", "grid_lat")
+RECORD_FIELDS = (
+    "event_id",
+    "event_time",
+    "ingestion_time",
+    "magnitude",
+    "depth_km",
+    "longitude",
+    "latitude",
+    "place",
+    "event_type",
+    "status",
+    "tsunami",
+    "significance",
+    "station_count",
+    "rms",
+    "azimuthal_gap",
+    "felt_count",
+    "url",
+    "grid_lon",
+    "grid_lat",
+    "cell_id",
+    "region_id",
+    "source",
 )
+EVENT_SCHEMA = StructType([StructField(name, StringType(), True) for name in RECORD_FIELDS])
+
+# Columns of a Kafka message the pipeline keeps (see kafka_messages()).
+MESSAGE_SCHEMA = "value string, kafka_partition int, kafka_offset long, kafka_ts timestamp"
 
 EVENT_COLUMNS = [
     "event_id",
@@ -157,6 +167,48 @@ def write_mainshock_rows(rows: list, pg_config: PostgresConfig, min_magnitude: f
     return len(mainshock_rows)
 
 
+REJECTED_COLUMNS = ["kafka_partition", "kafka_offset", "kafka_ts", "reject_reason", "event_id", "source", "value"]
+# Longest message text kept in rejected_records.
+REJECTED_VALUE_CHARS = 2000
+
+
+def write_rejected_rows(rows: list, batch_id: int, pg_config: PostgresConfig) -> int:
+    """Store the records the cleaning rules rejected, one row per Kafka message (idempotent on its offset)."""
+    if not rows:
+        return 0
+    values = [
+        (
+            r["kafka_partition"],
+            r["kafka_offset"],
+            r["kafka_ts"],
+            batch_id,
+            r["reject_reason"],
+            r["event_id"],
+            r["source"],
+            None if r["value"] is None else r["value"][:REJECTED_VALUE_CHARS],
+        )
+        for r in rows
+    ]
+    sql = """
+        INSERT INTO rejected_records (
+            kafka_partition, kafka_offset, received_at, batch_id, reason, event_id, source, raw_value
+        ) VALUES %s
+        ON CONFLICT (kafka_partition, kafka_offset) DO UPDATE SET
+            received_at = EXCLUDED.received_at, batch_id = EXCLUDED.batch_id, reason = EXCLUDED.reason,
+            event_id = EXCLUDED.event_id, source = EXCLUDED.source, raw_value = EXCLUDED.raw_value,
+            rejected_at = now()
+    """
+    with closing(pg_connect(pg_config)) as conn, conn, conn.cursor() as cur:
+        execute_values(cur, sql, values, page_size=500)
+    return len(values)
+
+
+def reason_summary(reasons) -> str:
+    """'2 missing event_time, 1 not a JSON object' (most frequent first)."""
+    counts = Counter(reasons)
+    return ", ".join(f"{n} {reason}" for reason, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+
+
 def utc_iso(value: datetime) -> str:
     """ISO text with an explicit +00:00 offset for SQL.
 
@@ -169,12 +221,33 @@ def utc_iso(value: datetime) -> str:
     return value.isoformat()
 
 
-def load_stored_events(spark: SparkSession, pg_config: PostgresConfig, lo, hi) -> DataFrame:
-    """Read the stored earthquakes in [lo, hi) back from PostgreSQL with Spark's JDBC source."""
+def merge_time_ranges(times: list[datetime], pad: timedelta) -> list[tuple[datetime, datetime]]:
+    """The union of [t - pad, t + pad] over ``times``, as sorted, non-overlapping ranges.
+
+    A micro-batch can hold events days or months apart (a late event next to live ones, or the
+    replay without REPLAY_REBASE_TO_NOW beside the live feed). One range from the oldest to the
+    newest event would read back every stored event in between; these ranges read only the
+    events that can share a window with the batch.
+    """
+    ranges: list[list[datetime]] = []
+    for t in sorted(times):
+        lo, hi = t - pad, t + pad
+        if ranges and lo <= ranges[-1][1]:
+            ranges[-1][1] = max(ranges[-1][1], hi)
+        else:
+            ranges.append([lo, hi])
+    return [(lo, hi) for lo, hi in ranges]
+
+
+def load_stored_events(spark: SparkSession, pg_config: PostgresConfig, ranges: list[tuple[datetime, datetime]]) -> DataFrame:
+    """Read the stored earthquakes in the given [lo, hi) ranges back from PostgreSQL with Spark's JDBC source."""
+    in_ranges = " OR ".join(
+        f"(event_time >= TIMESTAMPTZ '{utc_iso(lo)}' AND event_time < TIMESTAMPTZ '{utc_iso(hi)}')" for lo, hi in ranges
+    )
     query = (
         "SELECT event_id, event_time AS event_ts, magnitude, cell_id, grid_lon, grid_lat, region_id, source "
         "FROM seismic_events "
-        f"WHERE event_time >= TIMESTAMPTZ '{utc_iso(lo)}' AND event_time < TIMESTAMPTZ '{utc_iso(hi)}' "
+        f"WHERE ({in_ranges}) "
         "AND COALESCE(LOWER(event_type), 'earthquake') = 'earthquake'"
     )
     return (
@@ -591,11 +664,24 @@ def process_batch(
         return now
 
     # Materialise the micro-batch once; every later step reads the cached rows.
-    df = batch_df.dropDuplicates(["event_id"]).persist()
+    batch_df = batch_df.persist()
+    # Records that broke a cleaning rule are stored with their reason instead of vanishing.
+    rejected = batch_df.filter(F.col("reject_reason").isNotNull()).select(*REJECTED_COLUMNS).collect()
+    rejected_count = write_rejected_rows(rejected, batch_id, pg_config)
+    rejected_text = (
+        f", rejected={rejected_count} ({reason_summary(r['reject_reason'] for r in rejected)}; see rejected_records)"
+        if rejected_count
+        else ""
+    )
+    df = batch_df.filter(F.col("reject_reason").isNull()).dropDuplicates(["event_id"]).persist()
     rows = df.select(*EVENT_COLUMNS).collect()
     if not rows:
         df.unpersist()
-        print(f"Batch {batch_id}: empty", flush=True)
+        batch_df.unpersist()
+        if rejected_count:
+            print(f"Batch {batch_id}: received=0{rejected_text}", flush=True)
+        else:
+            print(f"Batch {batch_id}: empty", flush=True)
         return
     t = lap("read", started)
 
@@ -606,13 +692,12 @@ def process_batch(
     anomaly_count = bvalue_count = 0
     quake_times = [r["event_ts"] for r in rows if is_earthquake_type(r["event_type"])]
     if quake_times:
-        lo, hi = min(quake_times), max(quake_times)
         quakes = df.filter(is_earthquake(F.col("event_type"))).select(
             "event_id", "event_ts", "magnitude", "cell_id", "grid_lon", "grid_lat", "region_id", "source"
         )
         # Every stored event that can share a sliding window with this batch.
         recent = load_stored_events(
-            spark, pg_config, lo - timedelta(hours=MAX_WINDOW_HOURS), hi + timedelta(hours=MAX_WINDOW_HOURS)
+            spark, pg_config, merge_time_ranges(quake_times, timedelta(hours=MAX_WINDOW_HOURS))
         ).cache()
         anomaly_count = upsert_anomalies(recent, quakes, baseline_df, batch_id, cfg, pg_config)
         t = lap("anomalies", t)
@@ -625,9 +710,10 @@ def process_batch(
     forecast_count, forecasts_stored = compute_aftershock_forecasts(batch_id, cfg, pg_config)
     lap("omori", t)
     df.unpersist()
+    batch_df.unpersist()
     steps = " ".join(f"{k}={v:.1f}s" for k, v in timings.items())
     print(
-        f"Batch {batch_id}: received={len(rows)}, new_events={event_count}, mainshocks={mainshock_count}, "
+        f"Batch {batch_id}: received={len(rows)}{rejected_text}, new_events={event_count}, mainshocks={mainshock_count}, "
         f"anomaly_windows={anomaly_count}, bvalue_windows={bvalue_count}, active_regions={region_count}, "
         f"forecasts={forecast_count} (changed={forecasts_stored}) ({time.time() - started:.1f}s: {steps})",
         flush=True,
@@ -645,39 +731,153 @@ def build_spark() -> SparkSession:
     )
 
 
-def clean_events(raw: DataFrame) -> DataFrame:
-    """Parse, validate and enrich raw producer records (grid cell, coarse region, source)."""
+def kafka_messages(kafka_raw: DataFrame) -> DataFrame:
+    """The Kafka columns the pipeline uses: message text, where it is in the topic, and when it arrived."""
+    return kafka_raw.select(
+        F.col("value").cast("string").alias("value"),
+        F.col("partition").alias("kafka_partition"),
+        F.col("offset").alias("kafka_offset"),
+        F.col("timestamp").alias("kafka_ts"),
+    )
+
+
+def _not_a_number(raw, number):
+    """A field that holds something (not JSON null) that is not a finite number."""
+    return raw.isNotNull() & (number.isNull() | F.isnan(number) | (F.abs(number) == F.lit(float("inf"))))
+
+
+def clean_events(messages: DataFrame) -> DataFrame:
+    """Parse, validate and enrich Kafka messages (grid cell, coarse region, source).
+
+    ``messages`` has the columns of MESSAGE_SCHEMA. Every message stays in the output; a message
+    that breaks a cleaning rule gets the first rule it breaks in ``reject_reason`` (NULL for a
+    valid event), and process_batch() stores it in rejected_records instead of seismic_events.
+    Before, such records were filtered out here without any count or log line.
+    """
+    parsed = messages.select(
+        "*",
+        # NULL for anything that is not a JSON object: broken JSON, plain text, arrays, empty messages.
+        F.expr("json_object_keys(value)").isNotNull().alias("_is_object"),
+        F.from_json("value", EVENT_SCHEMA).alias("_record"),
+    ).select("value", "kafka_partition", "kafka_offset", "kafka_ts", "_is_object", "_record.*")
+
+    numbers = {name: F.col(name).cast("double") for name in DOUBLE_FIELDS + INT_FIELDS}
+    event_ts = F.to_timestamp("event_time")
+    reason = (
+        F.when(~F.col("_is_object"), "not a JSON object")
+        .when(F.coalesce(F.trim(F.col("event_id")), F.lit("")) == "", "missing event_id")
+        .when(F.col("event_time").isNull(), "missing event_time")
+        .when(event_ts.isNull(), "unparseable event_time")
+        .when(F.col("longitude").isNull() | F.col("latitude").isNull(), "missing longitude or latitude")
+    )
+    for name, number in numbers.items():
+        reason = reason.when(_not_a_number(F.col(name), number), f"{name} is not a number")
+    reason = reason.when(~numbers["longitude"].between(-180.0, 180.0), "longitude out of range").when(
+        ~numbers["latitude"].between(-90.0, 90.0), "latitude out of range"
+    )
+
+    cleaned = parsed.withColumn("reject_reason", reason).withColumn("event_ts", event_ts)
+    for name in DOUBLE_FIELDS:
+        cleaned = cleaned.withColumn(name, numbers[name])
+    for name in INT_FIELDS:
+        cleaned = cleaned.withColumn(name, numbers[name].cast("int"))
     return (
-        raw.withColumn("event_ts", F.to_timestamp("event_time"))
-        .withColumn("ingestion_ts", F.coalesce(F.to_timestamp("ingestion_time"), F.current_timestamp()))
-        .filter(
-            F.col("event_id").isNotNull()
-            & F.col("event_ts").isNotNull()
-            & F.col("longitude").between(-180.0, 180.0)
-            & F.col("latitude").between(-90.0, 90.0)
+        cleaned.withColumn(
+            "ingestion_ts", F.coalesce(F.to_timestamp("ingestion_time"), F.col("kafka_ts"), F.current_timestamp())
         )
         .withColumn("grid_lon", F.coalesce(F.col("grid_lon"), F.floor(F.col("longitude")).cast("int")))
         .withColumn("grid_lat", F.coalesce(F.col("grid_lat"), F.floor(F.col("latitude")).cast("int")))
         .withColumn("cell_id", F.coalesce(F.col("cell_id"), cell_id_expr(F.col("grid_lon"), F.col("grid_lat"))))
         .withColumn("region_id", F.coalesce(F.col("region_id"), region_id_expr(F.col("longitude"), F.col("latitude"))))
         .withColumn("source", F.coalesce(F.col("source"), F.lit("unknown")))
+        # A valid event is de-duplicated by its id; a rejected message by its place in the topic,
+        # so rejected messages never hide each other or a later valid copy of the same event.
+        .withColumn(
+            "dedup_key",
+            F.coalesce(
+                F.when(F.col("reject_reason").isNull(), F.col("event_id")).otherwise(
+                    F.concat(
+                        F.lit("rejected:"),
+                        F.col("kafka_partition").cast("string"),
+                        F.lit(":"),
+                        F.col("kafka_offset").cast("string"),
+                    )
+                ),
+                F.lit(""),
+            ),
+        )
+        .drop("_is_object")
     )
 
 
-# How long Spark remembers an event id. USGS revises events for days after they happen, and the
-# live producer backfills the last week, so a duplicate can arrive up to about 7 days later.
+# How long Spark remembers an event id, counted in arrival time (the Kafka message timestamp).
+# USGS revises events for days after they happen, and the live producer backfills the last week,
+# so a duplicate can arrive up to about 7 days after the first copy. PostgreSQL's
+# ON CONFLICT (event_id) catches anything older.
 DEDUP_WATERMARK = os.getenv("DEDUP_WATERMARK", "7 days")
 
 
-def prepare_stream(raw: DataFrame) -> DataFrame:
-    """Clean and enrich the parsed records and drop repeated event ids across micro-batches.
+def prepare_stream(messages: DataFrame) -> DataFrame:
+    """Clean and enrich the Kafka messages and drop repeated event ids across micro-batches.
 
-    dropDuplicatesWithinWatermark keeps each event id in the streaming state until the
-    event-time watermark has passed it by DEDUP_WATERMARK, so the state stays bounded
-    (plain dropDuplicates on event_id alone would keep every id forever). PostgreSQL's
-    ON CONFLICT (event_id) catches anything older.
+    dropDuplicatesWithinWatermark keeps each id in the streaming state until the watermark has
+    passed it by DEDUP_WATERMARK, so the state stays bounded (plain dropDuplicates on event_id
+    alone would keep every id forever).
+
+    The watermark is on the arrival time (kafka_ts), not on the event time. With the event
+    time, Spark also dropped every record whose event_time was more than 7 days older than the
+    newest event seen so far, without any message: a 10-day-old USGS event, or the replay
+    catalogue sent with REPLAY_REBASE_TO_NOW=false after the live feed, never reached
+    PostgreSQL. Arrival times only move forward, so nothing is dropped for being old. A record
+    is only dropped as late if its Kafka timestamp is more than 7 days older than the newest one
+    already processed (a producer that sets old message timestamps, or a partition read more
+    than 7 days behind the others); LateRecordsListener logs every such drop.
     """
-    return clean_events(raw).withWatermark("event_ts", DEDUP_WATERMARK).dropDuplicatesWithinWatermark(["event_id"])
+    return (
+        clean_events(messages)
+        .withWatermark("kafka_ts", DEDUP_WATERMARK)
+        .dropDuplicatesWithinWatermark(["dedup_key"])
+    )
+
+
+def rows_dropped_by_watermark(progress: dict) -> int:
+    """Rows the stateful operators of one micro-batch dropped as late (from its progress JSON)."""
+    return sum(int(op.get("numRowsDroppedByWatermark") or 0) for op in progress.get("stateOperators") or [])
+
+
+try:
+    from pyspark.sql.streaming import StreamingQueryListener
+except ImportError:  # pragma: no cover - PySpark before 3.4
+    StreamingQueryListener = object
+
+
+class LateRecordsListener(StreamingQueryListener):
+    """Logs every record Spark drops because it arrived behind the de-duplication watermark."""
+
+    def __init__(self):
+        super().__init__()
+        self.warnings: list[str] = []
+
+    def onQueryStarted(self, event):  # noqa: N802 - method names given by Spark
+        pass
+
+    def onQueryProgress(self, event):  # noqa: N802
+        progress = json.loads(event.progress.json)
+        dropped = rows_dropped_by_watermark(progress)
+        if dropped:
+            watermark = (progress.get("eventTime") or {}).get("watermark")
+            message = (
+                f"WARNING batch {progress.get('batchId')}: Spark dropped {dropped} record(s) whose Kafka timestamp "
+                f"is more than {DEDUP_WATERMARK} older than the newest one (watermark {watermark}); they are not stored"
+            )
+            self.warnings.append(message)
+            print(message, flush=True)
+
+    def onQueryIdle(self, event):  # noqa: N802
+        pass
+
+    def onQueryTerminated(self, event):  # noqa: N802
+        pass
 
 
 def main() -> int:
@@ -715,8 +915,9 @@ def main() -> int:
         .load()
     )
 
-    raw = kafka_raw.select(F.from_json(F.col("value").cast("string"), EVENT_SCHEMA).alias("event")).select("event.*")
-    stream_df = prepare_stream(raw)
+    stream_df = prepare_stream(kafka_messages(kafka_raw))
+    if StreamingQueryListener is not object:
+        spark.streams.addListener(LateRecordsListener())
 
     query = (
         stream_df.writeStream.foreachBatch(

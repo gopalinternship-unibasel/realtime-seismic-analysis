@@ -114,6 +114,21 @@ ALTER TABLE active_regions ADD COLUMN IF NOT EXISTS radius_limit_km DOUBLE PRECI
 ALTER TABLE active_regions ADD COLUMN IF NOT EXISTS max_k INTEGER;
 ALTER TABLE active_regions ADD COLUMN IF NOT EXISTS within_radius BOOLEAN;
 
+-- Kafka messages the cleaning rules rejected (not JSON, no id or time, coordinates missing or out
+-- of range, a numeric field that is not a number), one row per message, with the reason.
+CREATE TABLE IF NOT EXISTS rejected_records (
+    kafka_partition INTEGER NOT NULL,
+    kafka_offset BIGINT NOT NULL,
+    received_at TIMESTAMPTZ,
+    batch_id BIGINT NOT NULL,
+    reason TEXT NOT NULL,
+    event_id TEXT,
+    source TEXT,
+    -- The message text, cut to 2,000 characters.
+    raw_value TEXT,
+    rejected_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (kafka_partition, kafka_offset)
+);
 
 CREATE TABLE IF NOT EXISTS mainshocks (
     event_id TEXT PRIMARY KEY REFERENCES seismic_events(event_id) ON DELETE CASCADE,

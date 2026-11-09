@@ -51,7 +51,22 @@ UNION ALL SELECT 'active_regions', source, COUNT(*) FROM active_regions GROUP BY
 UNION ALL SELECT 'bvalue_windows', source, COUNT(*) FROM bvalue_windows GROUP BY source
 UNION ALL SELECT 'mainshocks', source, COUNT(*) FROM mainshocks GROUP BY source
 UNION ALL SELECT 'aftershock_forecasts', m.source, COUNT(*) FROM aftershock_forecasts f JOIN mainshocks m ON m.event_id = f.mainshock_id GROUP BY m.source
+UNION ALL SELECT 'rejected_records', COALESCE(source, '(none)'), COUNT(*) FROM rejected_records GROUP BY source
 ORDER BY 1, 2;
+"@
+& docker compose exec -T postgres psql -U $dbUser -d $dbName -c $sql
+
+Write-Host "`n== Kafka messages rejected by the cleaning rules (table rejected_records; none is normal)"
+$sql = @"
+SELECT reason, COUNT(*) AS messages, MAX(received_at) AS last_received FROM rejected_records GROUP BY reason ORDER BY 2 DESC, 1;
+"@
+& docker compose exec -T postgres psql -U $dbUser -d $dbName -c $sql
+
+Write-Host "`n== K-Means active regions (wider_than_limit > 0: more separate areas than MAX_KMEANS_CLUSTERS)"
+$sql = @"
+SELECT source, COUNT(*) AS regions, MAX(max_k) AS max_k, MAX(radius_limit_km) AS radius_limit_km,
+       ROUND(MAX(radius_km)::numeric, 0) AS widest_km, COUNT(*) FILTER (WHERE within_radius = FALSE) AS wider_than_limit
+FROM active_regions GROUP BY source ORDER BY 1;
 "@
 & docker compose exec -T postgres psql -U $dbUser -d $dbName -c $sql
 
