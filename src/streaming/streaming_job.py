@@ -36,6 +36,7 @@ from src.streaming.analytics import (
     bvalue_rows,
     bvalue_window_magnitudes,
     cell_id_expr,
+    grid_lon_expr,
     cluster_active_cells,
     is_earthquake,
     region_id_expr,
@@ -746,6 +747,13 @@ def _not_a_number(raw, number):
     return raw.isNotNull() & (number.isNull() | F.isnan(number) | (F.abs(number) == F.lit(float("inf"))))
 
 
+# How far an event time may lie ahead of the processing time before the record is rejected. USGS times
+# are origin times, always before the event is published; the margin only absorbs clock skew.
+# One far-future record used to move a source's clock (MAX(event_time)) years ahead, which
+# emptied its active regions and stopped all its Omori-Utsu forecasts without any message.
+MAX_FUTURE_SKEW_MINUTES = int(os.getenv("MAX_FUTURE_SKEW_MINUTES", "60"))
+
+
 def clean_events(messages: DataFrame) -> DataFrame:
     """Parse, validate and enrich Kafka messages (grid cell, coarse region, source).
 
@@ -768,6 +776,12 @@ def clean_events(messages: DataFrame) -> DataFrame:
         .when(F.coalesce(F.trim(F.col("event_id")), F.lit("")) == "", "missing event_id")
         .when(F.col("event_time").isNull(), "missing event_time")
         .when(event_ts.isNull(), "unparseable event_time")
+        # Compared with the time the job processes the message, not its Kafka timestamp: a
+        # producer that stamps messages with an old clock still has valid event times.
+        .when(
+            event_ts > F.current_timestamp() + F.expr(f"INTERVAL {MAX_FUTURE_SKEW_MINUTES} MINUTES"),
+            "event_time in the future",
+        )
         .when(F.col("longitude").isNull() | F.col("latitude").isNull(), "missing longitude or latitude")
     )
     for name, number in numbers.items():
@@ -785,10 +799,13 @@ def clean_events(messages: DataFrame) -> DataFrame:
         cleaned.withColumn(
             "ingestion_ts", F.coalesce(F.to_timestamp("ingestion_time"), F.col("kafka_ts"), F.current_timestamp())
         )
-        .withColumn("grid_lon", F.coalesce(F.col("grid_lon"), F.floor(F.col("longitude")).cast("int")))
-        .withColumn("grid_lat", F.coalesce(F.col("grid_lat"), F.floor(F.col("latitude")).cast("int")))
-        .withColumn("cell_id", F.coalesce(F.col("cell_id"), cell_id_expr(F.col("grid_lon"), F.col("grid_lat"))))
-        .withColumn("region_id", F.coalesce(F.col("region_id"), region_id_expr(F.col("longitude"), F.col("latitude"))))
+        # The grid fields always come from the coordinates. Before, a value sent by the producer
+        # won (coalesce), so a record with cell_id "99:99" at 10.5 E, 10.5 N was scored in a cell
+        # that does not exist.
+        .withColumn("grid_lon", grid_lon_expr(F.col("longitude")))
+        .withColumn("grid_lat", F.floor(F.col("latitude")).cast("int"))
+        .withColumn("cell_id", cell_id_expr(F.col("grid_lon"), F.col("grid_lat")))
+        .withColumn("region_id", region_id_expr(F.col("longitude"), F.col("latitude")))
         .withColumn("source", F.coalesce(F.col("source"), F.lit("unknown")))
         # A valid event is de-duplicated by its id; a rejected message by its place in the topic,
         # so rejected messages never hide each other or a later valid copy of the same event.

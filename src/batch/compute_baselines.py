@@ -25,7 +25,7 @@ from pyspark.sql import functions as F
 from pyspark.sql.types import DoubleType, StringType, StructField, StructType, TimestampType
 
 from src.common.seismo_models import estimate_b_value, estimate_completeness_magnitude
-from src.streaming.analytics import cell_id_expr, region_id_expr
+from src.streaming.analytics import cell_id_expr, grid_lon_expr, region_id_expr
 
 HISTORICAL_CSV = os.getenv("HISTORICAL_CSV", "/opt/workspace/data/historical/usgs_historical_events.csv")
 OUT_BASELINE = os.getenv("OUT_BASELINE", "/opt/workspace/data/baseline/cell_baselines.csv")
@@ -81,7 +81,7 @@ def enrich(df: DataFrame) -> DataFrame:
             & (F.coalesce(F.lower(F.col("event_type")), F.lit("earthquake")) == "earthquake")
         )
         .dropDuplicates(["event_id"])
-        .withColumn("grid_lon", F.floor("longitude").cast("int"))
+        .withColumn("grid_lon", grid_lon_expr(F.col("longitude")))
         .withColumn("grid_lat", F.floor("latitude").cast("int"))
         .withColumn("cell_id", cell_id_expr(F.col("grid_lon"), F.col("grid_lat")))
         .withColumn("region_id", region_id_expr(F.col("longitude"), F.col("latitude")))

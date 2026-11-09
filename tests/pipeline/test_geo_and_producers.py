@@ -48,6 +48,9 @@ def test_region_and_cell_formats():
     assert coarse_region(-72.5, -35.1) == "R-080_-40"
     assert coarse_region(5.0, 0.5) == "R+000_+00"
     assert grid_cell(-0.5, -0.5) == (-1, -1, "-1:-1")
+    # 180 and -180 are the same meridian.
+    assert grid_cell(180.0, -16.5) == grid_cell(-180.0, -16.5) == (-180, -17, "-180:-17")
+    assert coarse_region(180.0, -16.5) == coarse_region(-180.0, -16.5) == "R-180_-20"
 
 
 def test_haversine():

@@ -37,7 +37,7 @@ def baselines(spark, rows=(("-123:37", 0.2, 0.5),)):
 
 
 def test_spark_region_id_matches_python_region_id(spark):
-    points = [(-122.35, 37.62), (140.6, 35.2), (-72.5, -35.1), (5.0, 0.5), (-0.1, -0.1), (179.9, -89.0)]
+    points = [(-122.35, 37.62), (140.6, 35.2), (-72.5, -35.1), (5.0, 0.5), (-0.1, -0.1), (179.9, -89.0), (180.0, -16.5)]
     df = spark.createDataFrame(points, "lon double, lat double")
     got = [r["rid"] for r in df.select(region_id_expr(F.col("lon"), F.col("lat")).alias("rid")).collect()]
     assert got == [coarse_region(lon, lat) for lon, lat in points]

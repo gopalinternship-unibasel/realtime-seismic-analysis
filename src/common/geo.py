@@ -27,9 +27,19 @@ def safe_int(value: Any) -> Optional[int]:
         return None
 
 
+def cell_lon(lon: float) -> float:
+    """Longitude used for the grid: 180 and -180 are the same meridian, so 180 counts as -180.
+
+    Without this an event at exactly 180.0 got cell 180:x and region R+180_x, cells that no
+    other event on that meridian (sent as -180.0) shares.
+    """
+    return lon - 360.0 if lon >= 180.0 else lon
+
+
 def grid_cell(lon: Optional[float], lat: Optional[float]) -> tuple[Optional[int], Optional[int], Optional[str]]:
     if lon is None or lat is None:
         return None, None, None
+    lon = cell_lon(lon)
     grid_lon = math.floor(lon)
     grid_lat = math.floor(lat)
     return grid_lon, grid_lat, f"{grid_lon}:{grid_lat}"
@@ -38,7 +48,7 @@ def grid_cell(lon: Optional[float], lat: Optional[float]) -> tuple[Optional[int]
 def coarse_region(lon: Optional[float], lat: Optional[float], width: int = 10) -> Optional[str]:
     if lon is None or lat is None:
         return None
-    rg_lon = int(math.floor(lon / width) * width)
+    rg_lon = int(math.floor(cell_lon(lon) / width) * width)
     rg_lat = int(math.floor(lat / width) * width)
     return f"R{rg_lon:+04d}_{rg_lat:+03d}"
 

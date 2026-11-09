@@ -72,6 +72,7 @@ def test_cleaning_rules_give_every_rejected_record_a_reason(spark):
         record("nan-mag", "2026-11-09T01:00:00+00:00", magnitude="NaN"),
         record("text-lon", "2026-11-09T01:00:00+00:00", lon="west"),
         record("bool-depth", "2026-11-09T01:00:00+00:00", depth_km=True),
+        record("future", (datetime.now(timezone.utc) + timedelta(days=400)).isoformat()),
         '{"event_id": "broken", "event_time": ',
         "not json at all",
         "[1, 2, 3]",
@@ -95,6 +96,7 @@ def test_cleaning_rules_give_every_rejected_record_a_reason(spark):
         "magnitude is not a number",
         "longitude is not a number",
         "depth_km is not a number",
+        "event_time in the future",
         "not a JSON object",
         "not a JSON object",
         "not a JSON object",
@@ -106,7 +108,35 @@ def test_cleaning_rules_give_every_rejected_record_a_reason(spark):
     assert by_offset[3]["magnitude"] is None  # JSON null stays a missing magnitude, not an error
     assert by_offset[1]["cell_id"] == "-123:37" and by_offset[1]["region_id"] == "R-130_+30"
     # Rejected messages are keyed by their place in the topic, so they never hide each other.
-    assert by_offset[15]["dedup_key"] == "rejected:0:15" and by_offset[16]["dedup_key"] == "rejected:0:16"
+    assert by_offset[16]["dedup_key"] == "rejected:0:16" and by_offset[17]["dedup_key"] == "rejected:0:17"
+
+
+def test_event_times_within_the_clock_skew_margin_are_kept(spark):
+    now = datetime.now(timezone.utc)
+    values = [
+        record("soon", (now + timedelta(minutes=30)).isoformat()),
+        record("too-far", (now + timedelta(minutes=90)).isoformat()),
+    ]
+    rows = clean_events(static_messages(spark, Topic(), values, arrived=now)).collect()
+    assert {r["event_id"]: r["reject_reason"] for r in rows} == {"soon": None, "too-far": "event_time in the future"}
+
+
+def test_grid_fields_come_from_the_coordinates_not_from_the_producer(spark):
+    values = [
+        # A faulty producer: grid fields that contradict the coordinates.
+        record("wrong-cell", "2026-11-09T01:00:00+00:00", lon=10.5, lat=10.5,
+               cell_id="99:99", region_id="R+990_+90", grid_lon=99, grid_lat=99),
+        # 180 and -180 are the same meridian, so they share a cell and a region.
+        record("east-180", "2026-11-09T01:00:00+00:00", lon=180.0, lat=-16.5),
+        record("west-180", "2026-11-09T01:00:00+00:00", lon=-180.0, lat=-16.5),
+    ]
+    rows = {r["event_id"]: r for r in clean_events(static_messages(spark, Topic(), values)).collect()}
+    got = {k: (r["grid_lon"], r["grid_lat"], r["cell_id"], r["region_id"], r["longitude"]) for k, r in rows.items()}
+    assert got == {
+        "wrong-cell": (10, 10, "10:10", "R+010_+10", 10.5),
+        "east-180": (-180, -17, "-180:-17", "R-180_-20", 180.0),
+        "west-180": (-180, -17, "-180:-17", "R-180_-20", -180.0),
+    }
 
 
 def test_prepare_stream_deduplicates_by_arrival_time_and_keeps_old_events(spark, tmp_path):

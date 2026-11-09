@@ -37,11 +37,20 @@ DEFAULT_BASELINE_STD = 1.0
 MIN_BASELINE_STD = 0.1
 
 
+def cell_lon_expr(lon: Column) -> Column:
+    """Spark version of ``src.common.geo.cell_lon``: longitude 180 counts as -180 for the grid."""
+    return F.when(lon >= 180.0, lon - 360.0).otherwise(lon)
+
+
+def grid_lon_expr(lon: Column) -> Column:
+    return F.floor(cell_lon_expr(lon)).cast("int")
+
+
 def region_id_expr(lon: Column, lat: Column) -> Column:
     """Spark version of ``src.common.geo.coarse_region`` (same text, e.g. ``R-130_+30``)."""
     return F.format_string(
         "R%+04d_%+03d",
-        (F.floor(lon / 10) * 10).cast("int"),
+        (F.floor(cell_lon_expr(lon) / 10) * 10).cast("int"),
         (F.floor(lat / 10) * 10).cast("int"),
     )
 
