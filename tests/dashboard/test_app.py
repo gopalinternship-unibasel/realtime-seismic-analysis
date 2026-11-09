@@ -296,6 +296,55 @@ def test_layout_uses_the_responsive_stylesheet():
     assert "gridTemplateColumns" not in str(dash_app.app.layout)
 
 
+def unwrapped(callback):
+    """The function behind a Dash callback (Dash may wrap it to read the request context)."""
+    return getattr(callback, "__wrapped__", callback)
+
+
+def test_a_failed_query_raises_instead_of_returning_an_empty_table(monkeypatch):
+    from sqlalchemy.exc import OperationalError
+
+    def down(*_args, **_kwargs):
+        raise OperationalError("SELECT 1", {}, Exception('could not translate host name "postgres" to address\nmore'))
+
+    monkeypatch.setattr(dash_app.pd, "read_sql_query", down)
+    try:
+        dash_app.query_df("SELECT 1")
+    except dash_app.DatabaseUnavailable as exc:
+        assert str(exc) == 'could not translate host name "postgres" to address'
+    else:
+        raise AssertionError("query_df returned data although the database was down")
+
+
+def test_database_outage_is_shown_as_an_outage_not_as_zeros(monkeypatch):
+    # QA round 2: with PostgreSQL stopped the page said "Events 0, Anomalous cells 0, ...,
+    # latest event in view: none", which is what an empty feed looks like.
+    def down(*_args, **_kwargs):
+        raise dash_app.DatabaseUnavailable('could not translate host name "postgres" to address')
+
+    monkeypatch.setattr(dash_app, "query_df", down)
+    refresh = unwrapped(dash_app.refresh)
+    cards, world, regions, bchart, fchart, summary, updated, status = refresh(1, "all", "7d", 0, ["R-130_+30"], "m1")
+    values = [text_of(card.children[1]) for card in cards]
+    assert values == ["n/a"] * 6
+    assert "Database unavailable" in text_of(status) and 'host name "postgres"' in text_of(status)
+    assert "unknown (database unavailable)" in updated and "none" not in updated
+    for fig in (world, bchart, fchart):
+        assert len(fig.data) == 0 and "database cannot be read" in fig.layout.annotations[0].text
+    assert "database cannot be read" in text_of(regions) and "database cannot be read" in text_of(summary)
+
+    # The selectors keep the lists and the user's choices instead of clearing them.
+    result = unwrapped(dash_app.update_selectors)(1, "all", "7d", ["R-130_+30"], "m1", "all")
+    assert all(isinstance(v, type(dash_app.no_update)) for v in result)
+
+
+def test_an_empty_database_still_shows_zeros_and_no_alert(monkeypatch):
+    monkeypatch.setattr(dash_app, "query_df", lambda *_a, **_k: pd.DataFrame())
+    cards, *_rest, updated, status = unwrapped(dash_app.refresh)(1, "all", "7d", 0, [], None)
+    assert [text_of(card.children[1]) for card in cards] == ["0"] * 6
+    assert status is None and "latest event in view: none" in updated
+
+
 def test_regions_wider_than_the_radius_are_marked():
     regions = pd.DataFrame(
         {

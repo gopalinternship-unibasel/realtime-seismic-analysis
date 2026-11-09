@@ -91,6 +91,19 @@
   }
 }
 
+/* Shown instead of the figures while PostgreSQL cannot be read (refresh() in app.py). */
+.db-error {
+  border: 1px solid #fca5a5;
+  background-color: #fef2f2;
+  color: #991b1b;
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  font-size: 14px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
 /* Active regions wider than REGION_RADIUS_KM (k reached MAX_KMEANS_CLUSTERS). */
 .regions-warning {
   color: #b45309;

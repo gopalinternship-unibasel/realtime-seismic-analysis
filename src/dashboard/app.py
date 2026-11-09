@@ -6,8 +6,9 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from dash import Dash, Input, Output, State, dcc, html
+from dash import Dash, Input, Output, State, dcc, html, no_update
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import SQLAlchemyError
 
 from src.common.seismo_models import (
     AFTERSHOCK_RADIUS_KM,
@@ -28,8 +29,11 @@ DASH_HOST = os.getenv("DASH_HOST", "127.0.0.1")
 DASH_PORT = int(os.getenv("DASH_PORT", "8050"))
 REFRESH_MS = int(os.getenv("DASH_REFRESH_MS", "10000"))
 
+# connect_timeout: an unreachable database fails a refresh in seconds instead of hanging it.
 ENGINE = create_engine(
-    f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}", pool_pre_ping=True
+    f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}",
+    pool_pre_ping=True,
+    connect_args={"connect_timeout": int(os.getenv("DB_CONNECT_TIMEOUT", "5"))},
 )
 
 SOURCES = {"usgs-live": "Live USGS feed", "replay": "Replay demo"}
@@ -62,12 +66,30 @@ app.title = "Real-Time Seismic Activity Analysis"
 LABEL_STYLE = {"color": "#374151", "fontWeight": 600, "marginBottom": "6px", "display": "block"}
 
 
+class DatabaseUnavailable(RuntimeError):
+    """PostgreSQL could not answer a query; the message is safe to show (no credentials)."""
+
+
+def describe_db_error(exc: Exception) -> str:
+    """First line of the driver's message, e.g. 'could not translate host name "postgres" to address'."""
+    detail = str(getattr(exc, "orig", None) or exc).strip().splitlines()
+    first = detail[0].strip() if detail else exc.__class__.__name__
+    return first[:240]
+
+
 def query_df(sql: str, params: dict | None = None) -> pd.DataFrame:
+    """Run a query; raise DatabaseUnavailable when PostgreSQL cannot answer it.
+
+    It used to return an empty DataFrame on any error, so with PostgreSQL stopped the page
+    showed 0 events, 0 cells, 0 regions and "latest event: none", which looks exactly like an
+    empty feed. The callbacks catch DatabaseUnavailable and say that the database is down.
+    """
     try:
         return pd.read_sql_query(text(sql), ENGINE, params=params or {})
-    except Exception as exc:  # noqa: BLE001 - dashboard should stay up while pipeline starts.
-        print(f"Dashboard query failed: {exc}", flush=True)
-        return pd.DataFrame()
+    except SQLAlchemyError as exc:
+        reason = describe_db_error(exc)
+        print(f"Dashboard query failed: {reason}", flush=True)
+        raise DatabaseUnavailable(reason) from exc
 
 
 def selected_sources(source: str | None) -> list[str]:
@@ -574,6 +596,8 @@ app.layout = html.Div(
                     style={"color": "#4b5563", "marginTop": 0},
                 ),
                 html.Div(id="last-updated", style={"color": "#6b7280", "fontSize": "13px", "marginBottom": "12px"}),
+                # Empty while PostgreSQL answers; says so when it does not (see refresh()).
+                html.Div(id="db-status", role="alert"),
             ]
         ),
         dcc.Interval(id="refresh", interval=REFRESH_MS, n_intervals=0),
@@ -688,8 +712,12 @@ def update_selectors(_n, source, time_range, current_regions, current_mainshock,
         # covers an auto-refresh that fires while the source change is still in flight, which
         # used to win and keep the previous source's selection.
         current_regions, current_mainshock = None, None
-    region_opts, region_value = pick_regions(load_bvalue_region_options(sources, time_range), current_regions)
-    main_opts, main_value = pick_mainshock(load_mainshock_options(sources), current_mainshock)
+    try:
+        region_opts, region_value = pick_regions(load_bvalue_region_options(sources, time_range), current_regions)
+        main_opts, main_value = pick_mainshock(load_mainshock_options(sources), current_mainshock)
+    except DatabaseUnavailable:
+        # Keep the lists and the user's choices as they are; refresh() shows the error.
+        return no_update, no_update, no_update, no_update, no_update
     return region_opts, region_value, main_opts, main_value, source
 
 
@@ -701,6 +729,7 @@ def update_selectors(_n, source, time_range, current_regions, current_mainshock,
     Output("forecast-chart", "figure"),
     Output("forecast-summary", "children"),
     Output("last-updated", "children"),
+    Output("db-status", "children"),
     Input("refresh", "n_intervals"),
     Input("source", "value"),
     Input("time-range", "value"),
@@ -710,6 +739,66 @@ def update_selectors(_n, source, time_range, current_regions, current_mainshock,
 )
 def refresh(_n, source, time_range, min_mag, regions_selected, mainshock_id):
     sources = selected_sources(source)
+    try:
+        return render_dashboard(sources, time_range, min_mag, regions_selected, mainshock_id) + (None,)
+    except DatabaseUnavailable as exc:
+        return render_database_error(sources, str(exc))
+
+
+def no_data_figure(message: str, height: int) -> go.Figure:
+    fig = go.Figure()
+    fig.add_annotation(text=message, showarrow=False, x=0.5, y=0.5, xref="paper", yref="paper")
+    fig.update_layout(height=height, margin={"r": 20, "t": 20, "l": 20, "b": 20},
+                      xaxis={"visible": False}, yaxis={"visible": False})
+    return fig
+
+
+def render_database_error(sources: list[str], reason: str) -> tuple:
+    """What the page shows while PostgreSQL cannot be read: no numbers at all, and why.
+
+    Zeros would claim that the feed is empty; "n/a" and the alert make clear that nothing is known.
+    """
+    now = datetime.now(tz=timezone.utc)
+    unavailable = "No data: the database cannot be read"
+    cards = [
+        metric_card(label, "n/a", card_id)
+        for label, card_id in [
+            ("Events", "metric-events"),
+            ("Anomalous cells", "metric-anomalous-cells"),
+            ("Active regions (K-Means)", "metric-active-regions"),
+            ("b-value windows", "metric-bvalue-windows"),
+            ("b-value alerts", "metric-bvalue-alerts"),
+            ("Active mainshocks", "metric-mainshocks"),
+        ]
+    ]
+    alert = html.Div(
+        [
+            html.Strong("Database unavailable. "),
+            f"The dashboard cannot read PostgreSQL ({DB_HOST}:{DB_PORT}, database {DB_NAME}) at "
+            f"{now:%Y-%m-%d %H:%M:%S} UTC: {reason}. No figures are shown because they would be wrong; "
+            "the page tries again at every refresh. Check that the postgres container runs "
+            "(scripts/check.ps1, or docker compose ps postgres).",
+        ],
+        id="db-error",
+        className="db-error",
+    )
+    updated = (
+        f"Updated {now:%Y-%m-%d %H:%M:%S} UTC · source: {', '.join(source_label(s) for s in sources)} · "
+        "latest event in view: unknown (database unavailable)"
+    )
+    return (
+        cards,
+        no_data_figure(unavailable, 520),
+        html.Div(unavailable + ".", style={"color": "#b91c1c"}),
+        no_data_figure(unavailable, 380),
+        no_data_figure(unavailable, 380),
+        [html.Div(unavailable + ".")],
+        updated,
+        alert,
+    )
+
+
+def render_dashboard(sources: list[str], time_range, min_mag, regions_selected, mainshock_id) -> tuple:
     ev_clause, ev_params = time_clause("event_time", time_range)
     mag_clause = " AND magnitude >= :min_mag" if (min_mag or 0) > 0 else ""
     params = {"sources": sources, "min_mag": float(min_mag or 0), **ev_params}
