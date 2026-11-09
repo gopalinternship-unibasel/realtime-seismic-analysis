@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from src.common.kafka_io import make_kafka_producer, publish_events
@@ -14,9 +15,9 @@ REPLAY_FILE = Path(os.getenv("REPLAY_FILE", "/opt/workspace/data/replay_catalog/
 EVENTS_PER_BATCH = int(os.getenv("EVENTS_PER_BATCH", os.getenv("EVENTS_PER_FILE", "25")))
 REPLAY_SLEEP_SECONDS = float(os.getenv("REPLAY_SLEEP_SECONDS", "3"))
 LOOP_REPLAY = os.getenv("LOOP_REPLAY", "false").lower() == "true"
-# Shift the catalogue in time so that its last event happens "now". The demo then behaves
-# like live data: windows, the 30-day active-mainshock cutoff and the dashboard time filters
-# all work on the replayed events.
+# Shift the catalogue in time (by whole hours) so that its last event happens within the last
+# hour. The demo then behaves like live data: windows, the 30-day active-mainshock cutoff and
+# the dashboard time filters all work on the replayed events.
 REPLAY_REBASE_TO_NOW = os.getenv("REPLAY_REBASE_TO_NOW", "true").lower() == "true"
 REPLAY_SOURCE = "replay"
 
@@ -31,8 +32,21 @@ def parse_time(value: str) -> datetime:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
+def rebase_shift(latest: datetime, now: datetime) -> timedelta:
+    """The whole number of hours that moves ``latest`` into the hour before ``now``.
+
+    The sliding windows (6 h and 24 h, sliding by 1 h) start on whole UTC hours. A shift of
+    exactly ``now - latest`` moved every event by a different fraction of an hour on each start,
+    so the events fell into different windows and the replay gave, for example, 33 or 34
+    b-value windows and 61 or 63 anomaly windows depending on the minute it was started.
+    Whole hours keep every event's position in the window grid, so every start gives the
+    same windows, b-values and z-scores.
+    """
+    return timedelta(hours=math.floor((now - latest).total_seconds() / 3600.0))
+
+
 def prepare_records(records: list[dict], now: datetime | None = None, rebase: bool = True) -> list[dict]:
-    """Tag records as replay data and (optionally) move the catalogue so it ends at ``now``.
+    """Tag records as replay data and (optionally) move the catalogue so it ends within the hour before ``now``.
 
     Relative spacing between events is kept, so the mainshock-aftershock sequence is unchanged.
     """
@@ -40,7 +54,7 @@ def prepare_records(records: list[dict], now: datetime | None = None, rebase: bo
     shift = None
     if rebase and records:
         latest = max(parse_time(r["event_time"]) for r in records)
-        shift = now - latest
+        shift = rebase_shift(latest, now)
     prepared = []
     for record in records:
         out = dict(record)
