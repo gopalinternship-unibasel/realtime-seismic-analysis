@@ -72,11 +72,41 @@ def test_replay_rebase_moves_catalogue_to_now_and_keeps_spacing():
     assert kept[-1]["event_time"] == "2026-05-17T09:00:00+00:00"
 
 
+REPLAY_FILE = Path(__file__).resolve().parents[2] / "data/replay_catalog/sample_replay_events.jsonl"
+
+
 def test_replay_catalogue_has_a_mainshock_sequence():
-    path = Path(__file__).resolve().parents[2] / "data/replay_catalog/sample_replay_events.jsonl"
-    records = replay_producer.read_jsonl(path)
-    assert len(records) == 84
+    records = replay_producer.read_jsonl(REPLAY_FILE)
+    assert len(records) == 184  # 84 hand-made records + 100 generated aftershocks
     assert max(r["magnitude"] for r in records) >= 5.0
+    # Enough events in the mainshock's region for 24-hour b-value windows (20 above Mc).
+    assert sum(r["region_id"] == "R-130_+30" for r in records) > 100
+
+
+def test_generated_aftershocks_are_reproducible_and_follow_the_mainshock(tmp_path):
+    from src.producer import extend_replay_catalog as gen
+
+    copy = tmp_path / "catalogue.jsonl"
+    copy.write_text(REPLAY_FILE.read_text(encoding="utf-8"), encoding="utf-8")
+    gen.main(copy)
+    gen.main(copy)  # running twice replaces the generated events instead of adding more
+    assert copy.read_text(encoding="utf-8") == REPLAY_FILE.read_text(encoding="utf-8")
+
+    records = replay_producer.read_jsonl(copy)
+    original = [r for r in records if not r["event_id"].startswith(gen.GENERATED_PREFIX)]
+    generated = [r for r in records if r["event_id"].startswith(gen.GENERATED_PREFIX)]
+    assert (len(original), len(generated)) == (84, gen.N_AFTERSHOCKS)
+    main = next(r for r in original if r["event_id"] == gen.MAINSHOCK_ID)
+    t0 = replay_producer.parse_time(main["event_time"])
+    for r in generated:
+        hours = (replay_producer.parse_time(r["event_time"]) - t0).total_seconds() / 3600
+        assert 0 < hours <= gen.SPAN_HOURS
+        assert gen.M_MIN <= r["magnitude"] <= gen.M_MAX
+        assert haversine_km(main["longitude"], main["latitude"], r["longitude"], r["latitude"]) <= gen.MAX_DISTANCE_KM + 0.1
+        assert (r["cell_id"], r["region_id"]) == ("-123:37", "R-130_+30")
+    # Omori-Utsu decay: more aftershocks in the first two hours than in the last ten.
+    hours = [(replay_producer.parse_time(r["event_time"]) - t0).total_seconds() / 3600 for r in generated]
+    assert sum(h <= 2 for h in hours) > sum(h > 12 for h in hours)
 
 
 class FakeFuture:
