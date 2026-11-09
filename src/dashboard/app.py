@@ -12,9 +12,11 @@ from sqlalchemy import create_engine, text
 from src.common.seismo_models import (
     AFTERSHOCK_RADIUS_KM,
     AFTERSHOCK_WINDOW_DAYS,
+    MIN_AFTERSHOCKS_FOR_P,
     aftershock_hours,
     omori_expected,
     omori_rate,
+    search_box_params,
 )
 
 DB_USER = os.getenv("POSTGRES_USER", "seismic")
@@ -47,17 +49,14 @@ TIME_RANGE_OPTIONS = [
 ]
 DEFAULT_REGIONS = 4
 CLUSTER_COLORS = ["#d62728", "#1f77b4", "#2ca02c", "#9467bd", "#ff7f0e", "#8c564b", "#e377c2", "#17becf"]
+# A forecast whose start is more than this before its source's latest event was not refitted.
+STALE_FORECAST_SECONDS = 60
 
-app = Dash(__name__)
+# The page layout (cards, responsive grids) is in assets/responsive.css.
+ASSETS_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+app = Dash(__name__, assets_folder=ASSETS_FOLDER)
 app.title = "Real-Time Seismic Activity Analysis"
 
-CARD_STYLE = {
-    "border": "1px solid #e5e7eb",
-    "borderRadius": "12px",
-    "padding": "16px",
-    "boxShadow": "0 1px 3px rgba(0,0,0,0.08)",
-    "backgroundColor": "white",
-}
 LABEL_STYLE = {"color": "#374151", "fontWeight": 600, "marginBottom": "6px", "display": "block"}
 
 
@@ -202,15 +201,79 @@ def build_bvalue_chart(bvalues: pd.DataFrame) -> go.Figure:
     else:
         fig.add_annotation(text="No b-value windows for this selection yet", showarrow=False, x=0.5, y=0.5,
                            xref="paper", yref="paper")
+    # The chart title is the card heading (HTML wraps on a narrow screen; an SVG title is clipped).
     fig.update_layout(
-        title="Gutenberg–Richter b-value (24 h sliding windows)",
         xaxis_title="Window end (UTC)",
         yaxis_title="b-value",
-        margin={"r": 20, "t": 50, "l": 50, "b": 40},
+        margin={"r": 20, "t": 20, "l": 50, "b": 40},
         height=380,
         legend={"orientation": "h", "y": -0.25},
     )
     return fig
+
+
+def forecast_start_time(mainshock: dict, forecast: dict) -> pd.Timestamp | None:
+    """The time the stored forecast starts: mainshock time + forecast_origin_hours."""
+    origin = forecast.get("forecast_origin_hours")
+    if origin is None or pd.isna(origin):
+        return None
+    return pd.Timestamp(mainshock["event_time"]) + pd.Timedelta(hours=float(origin))
+
+
+def is_stale(start, clock, active: bool = True) -> bool:
+    """An active mainshock's forecast is stale when it starts before its source's latest event."""
+    if not active or start is None or clock is None or pd.isna(start) or pd.isna(clock):
+        return False
+    return (pd.Timestamp(clock) - pd.Timestamp(start)).total_seconds() > STALE_FORECAST_SECONDS
+
+
+def forecast_summary(mainshock: dict | None, forecast: dict | None) -> list:
+    """The mainshock and the fitted numbers as text above the Omori-Utsu chart.
+
+    They used to be the chart's SVG title and subtitle, which Plotly does not wrap: the
+    subtitle was clipped at the right edge of the card (for example "generic p=1.08 (under 5 afte").
+    """
+    if not mainshock or not forecast:
+        return [html.Div("No Omori–Utsu forecast for this selection yet.")]
+    p = float(forecast["p_value"])
+    count = int(forecast["aftershock_count"])
+    p_was_fitted = bool(forecast.get("p_estimated", True))
+    p_text = (
+        f"p = {p:.2f} (fitted), R² = {float(forecast['r_squared']):.2f}"
+        if p_was_fitted
+        else f"p = {p:.2f} (generic value: fewer than {MIN_AFTERSHOCKS_FOR_P} aftershocks)"
+    )
+    start = forecast_start_time(mainshock, forecast)
+    start_text = f" after {start:%Y-%m-%d %H:%M} UTC" if start is not None else ""
+    lines = [
+        html.Div(
+            html.Strong(
+                f"M{float(mainshock['magnitude']):.1f} {mainshock.get('place') or mainshock.get('event_id')} · "
+                f"{pd.Timestamp(mainshock['event_time']):%Y-%m-%d %H:%M} UTC"
+            )
+        ),
+        html.Div(
+            f"{count} aftershocks within {AFTERSHOCK_RADIUS_KM:.0f} km and {AFTERSHOCK_WINDOW_DAYS} days · "
+            f"K = {float(forecast['k_value']):.1f}/day, c = {float(forecast['c_value']):.2f} d, {p_text}"
+        ),
+        html.Div(
+            f"Expected aftershocks{start_text}: {float(forecast['next_hour_rate']):.2f} in the next hour, "
+            f"{float(forecast['next_six_hour_expected']):.2f} in the next 6 hours"
+        ),
+    ]
+    clock = mainshock.get("clock")
+    if not mainshock.get("active", True):
+        lines.append(html.Div("Inactive: more than 30 days before the latest event; this is its last forecast.",
+                              className="forecast-warning"))
+    elif is_stale(start, clock):
+        lines.append(
+            html.Div(
+                f"Not refitted since {start:%Y-%m-%d %H:%M} UTC although the data now runs to "
+                f"{pd.Timestamp(clock):%Y-%m-%d %H:%M} UTC.",
+                className="forecast-warning",
+            )
+        )
+    return lines
 
 
 def build_forecast_chart(mainshock: dict | None, forecast: dict | None, hours_after: list[float]) -> go.Figure:
@@ -218,11 +281,10 @@ def build_forecast_chart(mainshock: dict | None, forecast: dict | None, hours_af
     if not mainshock or not forecast:
         fig.add_annotation(text="No Omori–Utsu forecast for this selection yet", showarrow=False, x=0.5, y=0.5,
                            xref="paper", yref="paper")
-        fig.update_layout(title="Omori–Utsu aftershock forecast", height=380)
+        fig.update_layout(height=380, margin={"r": 20, "t": 20, "l": 50, "b": 40})
         return fig
 
     k, c, p = float(forecast["k_value"]), float(forecast["c_value"]), float(forecast["p_value"])
-    p_was_fitted = bool(forecast.get("p_estimated", True))
     origin = forecast.get("forecast_origin_hours")
     if origin is None or pd.isna(origin):
         origin = float(np.ceil(max(hours_after))) if hours_after else 0.0
@@ -246,7 +308,9 @@ def build_forecast_chart(mainshock: dict | None, forecast: dict | None, hours_af
             x=curve_h,
             y=[omori_rate(k, c, p, h) for h in curve_h],
             mode="lines",
-            name=f"Fitted Omori-Utsu n(t)=K(t+c)^-p  (K={k:.1f}/day, c={c:.2f} d, p={p:.2f})",
+            # Short: a long legend entry is clipped on a narrow screen (the parameters are in the summary).
+            name="Fitted Omori-Utsu rate",
+            hovertemplate=f"%{{x:.1f}} h: %{{y:.2f}} per hour<extra>K={k:.1f}/day, c={c:.2f} d, p={p:.2f}</extra>",
             line={"color": "#1d4ed8", "width": 2},
         )
     )
@@ -261,17 +325,11 @@ def build_forecast_chart(mainshock: dict | None, forecast: dict | None, hours_af
         )
     )
     fig.add_vrect(x0=origin, x1=origin + 6, fillcolor="#fee2e2", opacity=0.5, line_width=0)
+    # Mainshock and fitted numbers are in forecast_summary() (HTML, wraps on any screen width).
     fig.update_layout(
-        title=(
-            f"Omori–Utsu forecast: M{float(mainshock['magnitude']):.1f} {mainshock.get('place') or ''}<br>"
-            f"<sup>{int(forecast['aftershock_count'])} aftershocks within {AFTERSHOCK_RADIUS_KM:.0f} km · "
-            f"next hour {float(forecast['next_hour_rate']):.2f} · next 6 h {float(forecast['next_six_hour_expected']):.2f} expected · "
-            + (f"R²={float(forecast['r_squared']):.2f}" if p_was_fitted else f"generic p={p:.2f} (under 5 aftershocks)")
-            + "</sup>"
-        ),
         xaxis_title="Hours after mainshock",
         yaxis_title="Aftershocks per hour",
-        margin={"r": 20, "t": 70, "l": 50, "b": 40},
+        margin={"r": 20, "t": 20, "l": 50, "b": 40},
         height=380,
         legend={"orientation": "h", "y": -0.25},
         bargap=0.05,
@@ -282,7 +340,7 @@ def build_forecast_chart(mainshock: dict | None, forecast: dict | None, hours_af
 def metric_card(label: str, value, card_id: str) -> html.Div:
     return html.Div(
         [html.Div(label, style={"color": "#6b7280"}), html.H2(str(value), style={"margin": "4px 0"})],
-        style=CARD_STYLE,
+        className="card",
         id=card_id,
     )
 
@@ -335,18 +393,29 @@ def load_bvalue_region_options(sources: list[str], time_range: str) -> pd.DataFr
 
 
 def load_mainshock_options(sources: list[str]) -> pd.DataFrame:
+    """Mainshocks with a forecast, newest active first.
+
+    M >= 5 events that belong to the sequence of a larger event (larger_event_id set by the
+    streaming job) are not listed: the larger event's forecast covers them. forecast_start and
+    clock (the source's latest event) let the list mark a forecast that was not refitted.
+    """
     return query_df(
         """
         SELECT m.event_id, m.event_time, m.magnitude, m.place, m.source, m.active,
-               f.next_six_hour_expected, f.fitted_at
+               f.next_six_hour_expected, f.fitted_at,
+               m.event_time + make_interval(secs => f.forecast_origin_hours * 3600) AS forecast_start,
+               c.clock
         FROM mainshocks m
         JOIN LATERAL (
-            SELECT next_six_hour_expected, fitted_at FROM aftershock_forecasts af
+            SELECT next_six_hour_expected, fitted_at, forecast_origin_hours FROM aftershock_forecasts af
             WHERE af.mainshock_id = m.event_id ORDER BY af.fitted_at DESC, af.id DESC LIMIT 1
         ) f ON TRUE
-        WHERE m.source = ANY(:sources)
+        LEFT JOIN (
+            SELECT source, MAX(event_time) AS clock FROM seismic_events WHERE source = ANY(:sources) GROUP BY source
+        ) c ON c.source = m.source
+        WHERE m.source = ANY(:sources) AND m.larger_event_id IS NULL
         ORDER BY m.active DESC, m.event_time DESC
-        LIMIT 50
+        LIMIT 200
         """,
         {"sources": sources},
     )
@@ -354,7 +423,11 @@ def load_mainshock_options(sources: list[str]) -> pd.DataFrame:
 
 def load_forecast_detail(mainshock_id: str) -> tuple[dict | None, dict | None, list[float]]:
     mainshock = query_df(
-        "SELECT event_id, event_time, magnitude, longitude, latitude, place, source FROM mainshocks WHERE event_id = :id",
+        """
+        SELECT m.event_id, m.event_time, m.magnitude, m.longitude, m.latitude, m.place, m.source, m.active,
+               (SELECT MAX(event_time) FROM seismic_events s WHERE s.source = m.source) AS clock
+        FROM mainshocks m WHERE m.event_id = :id
+        """,
         {"id": mainshock_id},
     )
     if mainshock.empty:
@@ -364,12 +437,15 @@ def load_forecast_detail(mainshock_id: str) -> tuple[dict | None, dict | None, l
         "SELECT * FROM aftershock_forecasts WHERE mainshock_id = :id ORDER BY fitted_at DESC, id DESC LIMIT 1",
         {"id": mainshock_id},
     )
+    # The same aftershock search as the streaming job (compute_aftershock_forecasts).
+    lat0, lat1, lon0, lon1, lon2, lon3 = search_box_params(float(main["longitude"]), float(main["latitude"]))
     candidates = query_df(
         """
         SELECT event_time, longitude, latitude FROM seismic_events
         WHERE source = :source AND event_time > :t0 AND event_time <= :t0 + make_interval(days => :days)
           AND magnitude < :mag AND COALESCE(LOWER(event_type), 'earthquake') = 'earthquake'
-          AND longitude BETWEEN :lon0 AND :lon1 AND latitude BETWEEN :lat0 AND :lat1
+          AND latitude BETWEEN :lat0 AND :lat1
+          AND (longitude BETWEEN :lon0 AND :lon1 OR longitude BETWEEN :lon2 AND :lon3)
         ORDER BY event_time
         """,
         {
@@ -377,10 +453,12 @@ def load_forecast_detail(mainshock_id: str) -> tuple[dict | None, dict | None, l
             "t0": main["event_time"],
             "days": AFTERSHOCK_WINDOW_DAYS,
             "mag": float(main["magnitude"]),
-            "lon0": float(main["longitude"]) - 4.0,
-            "lon1": float(main["longitude"]) + 4.0,
-            "lat0": float(main["latitude"]) - 4.0,
-            "lat1": float(main["latitude"]) + 4.0,
+            "lat0": lat0,
+            "lat1": lat1,
+            "lon0": lon0,
+            "lon1": lon1,
+            "lon2": lon2,
+            "lon3": lon3,
         },
     )
     rows = []
@@ -439,14 +517,8 @@ controls = html.Div(
             ]
         ),
     ],
-    style={
-        **CARD_STYLE,
-        "display": "grid",
-        "gridTemplateColumns": "minmax(240px, 1.2fr) minmax(180px, 1fr) minmax(260px, 1.5fr) minmax(120px, 0.6fr)",
-        "gap": "20px",
-        "alignItems": "start",
-        "marginBottom": "16px",
-    },
+    # Four columns on a wide screen, two on a tablet, one on a phone (assets/responsive.css).
+    className="card controls-grid",
     id="controls",
 )
 
@@ -467,46 +539,42 @@ app.layout = html.Div(
         # The data source the region and mainshock selections were made for.
         dcc.Store(id="selector-source"),
         controls,
-        html.Div(
-            id="metrics",
-            style={"display": "grid", "gridTemplateColumns": "repeat(auto-fit, minmax(160px, 1fr))", "gap": "12px"},
-        ),
-        html.Div([dcc.Graph(id="world-map")], style={**CARD_STYLE, "marginTop": "16px"}),
+        html.Div(id="metrics", className="metrics-grid"),
+        html.Div([dcc.Graph(id="world-map")], className="card", style={"marginTop": "16px"}),
         html.Div(
             [
                 html.H3("Active seismic regions (K-Means over anomalous cells)", style={"marginTop": 0}),
                 html.Div(id="regions-table"),
             ],
-            style={**CARD_STYLE, "marginTop": "16px", "overflowX": "auto"},
+            className="card",
+            style={"marginTop": "16px", "overflowX": "auto"},
         ),
         html.Div(
             [
                 html.Div(
                     [
+                        html.H3("Gutenberg–Richter b-value (24 h sliding windows)", className="card-title"),
                         html.Label("Regions (10° × 10°)", htmlFor="bvalue-regions", style=LABEL_STYLE),
                         dcc.Dropdown(id="bvalue-regions", multi=True, placeholder="Choose regions"),
                         dcc.Graph(id="bvalue-chart"),
                     ],
-                    style=CARD_STYLE,
+                    className="card",
                 ),
                 html.Div(
                     [
+                        html.H3("Omori–Utsu aftershock forecast", className="card-title"),
                         html.Label("Mainshock (M ≥ 5)", htmlFor="mainshock", style=LABEL_STYLE),
                         dcc.Dropdown(id="mainshock", placeholder="Choose a mainshock"),
+                        html.Div(id="forecast-summary", className="forecast-summary"),
                         dcc.Graph(id="forecast-chart"),
                     ],
-                    style=CARD_STYLE,
+                    className="card",
                 ),
             ],
-            style={
-                "display": "grid",
-                "gridTemplateColumns": "repeat(auto-fit, minmax(420px, 1fr))",
-                "gap": "16px",
-                "marginTop": "16px",
-            },
+            className="charts-grid",
         ),
     ],
-    style={"fontFamily": "Inter, system-ui, -apple-system, Segoe UI, sans-serif", "padding": "24px", "backgroundColor": "#f9fafb"},
+    className="page",
 )
 
 
@@ -540,10 +608,16 @@ def pick_regions(options: pd.DataFrame, current: list[str] | None) -> tuple[list
 def pick_mainshock(options: pd.DataFrame, current: str | None) -> tuple[list[dict], str | None]:
     if options.empty:
         return [], None
+    def status(r) -> str:
+        if not r.active:
+            return " (inactive)"
+        start, clock = getattr(r, "forecast_start", None), getattr(r, "clock", None)
+        return f" (not refitted since {pd.Timestamp(start):%m-%d %H:%M})" if is_stale(start, clock) else ""
+
     opts = [
         {
             "label": f"M{r.magnitude:.1f} {r.place or r.event_id} · {pd.Timestamp(r.event_time):%Y-%m-%d %H:%M} UTC"
-            f" · next 6 h ≈ {r.next_six_hour_expected:.2f}" + ("" if r.active else " (inactive)"),
+            f" · next 6 h ≈ {r.next_six_hour_expected:.2f}" + status(r),
             "value": r.event_id,
         }
         for r in options.itertuples(index=False)
@@ -584,6 +658,7 @@ def update_selectors(_n, source, time_range, current_regions, current_mainshock,
     Output("regions-table", "children"),
     Output("bvalue-chart", "figure"),
     Output("forecast-chart", "figure"),
+    Output("forecast-summary", "children"),
     Output("last-updated", "children"),
     Input("refresh", "n_intervals"),
     Input("source", "value"),
@@ -651,8 +726,11 @@ def refresh(_n, source, time_range, min_mag, regions_selected, mainshock_id):
         """,
         {"sources": sources, **win_params},
     )
+    # Mainshocks only: M >= 5 events inside the sequence of a larger event are not counted.
     mainshocks = query_df(
-        "SELECT COUNT(*) AS count FROM mainshocks WHERE active = TRUE AND source = ANY(:sources)", {"sources": sources}
+        "SELECT COUNT(*) AS count FROM mainshocks WHERE active = TRUE AND larger_event_id IS NULL "
+        "AND source = ANY(:sources)",
+        {"sources": sources},
     )
     main, forecast, hours = load_forecast_detail(mainshock_id) if mainshock_id else (None, None, [])
 
@@ -680,6 +758,7 @@ def refresh(_n, source, time_range, min_mag, regions_selected, mainshock_id):
         regions_table(regions),
         build_bvalue_chart(bvalues),
         build_forecast_chart(main, forecast, hours),
+        forecast_summary(main, forecast),
         updated,
     )
 

@@ -1,0 +1,92 @@
+/* Layout of the seismic dashboard. Dash serves every .css file in this folder automatically.
+   The grids used to be inline styles with fixed minimum column widths (240+180+260+120 px for
+   the controls, 420 px for the chart cards), so the page was 519 px wider than a 390 px phone. */
+
+.page {
+  font-family: Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+  padding: 24px;
+  background-color: #f9fafb;
+  box-sizing: border-box;
+  max-width: 100%;
+}
+
+.page *,
+.page *::before,
+.page *::after {
+  box-sizing: border-box;
+}
+
+.card {
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  padding: 16px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+  background-color: white;
+  /* Grid items default to min-width: auto, which lets long content (dropdown labels,
+     table cells, Plotly's SVG) push the column wider than the screen. */
+  min-width: 0;
+}
+
+.controls-grid {
+  display: grid;
+  grid-template-columns: minmax(240px, 1.2fr) minmax(180px, 1fr) minmax(260px, 1.5fr) minmax(120px, 0.6fr);
+  gap: 20px;
+  align-items: start;
+  margin-bottom: 16px;
+}
+
+.metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 160px), 1fr));
+  gap: 12px;
+}
+
+.charts-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr));
+  gap: 16px;
+  margin-top: 16px;
+}
+
+.card-title {
+  margin: 0 0 10px 0;
+  font-size: 17px;
+  color: #111827;
+}
+
+.forecast-summary {
+  color: #374151;
+  font-size: 14px;
+  line-height: 1.45;
+  margin: 10px 0 4px 0;
+  overflow-wrap: anywhere;
+}
+
+.forecast-summary .forecast-warning {
+  color: #b45309;
+}
+
+@media (max-width: 1100px) {
+  .controls-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 640px) {
+  .page {
+    padding: 12px;
+  }
+  .page h1 {
+    font-size: 24px;
+  }
+  .controls-grid {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 14px;
+  }
+  .metrics-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .card {
+    padding: 12px;
+  }
+}

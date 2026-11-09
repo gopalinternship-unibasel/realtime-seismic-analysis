@@ -89,7 +89,10 @@ def test_forecast_chart_shows_observations_fit_and_forecast():
     names = [trace.name for trace in fig.data]
     assert names[0] == "Observed aftershocks per hour"
     assert names[1].startswith("Fitted Omori-Utsu")
+    assert len(names[1]) <= 30  # a long legend entry is clipped on a phone
     assert names[2] == "Forecast, next 6 h"
+    # No SVG title (it was clipped at the card edge); the text is HTML in forecast_summary().
+    assert not fig.layout.title.text
     assert list(fig.data[2].x) == [22.5, 23.5, 24.5, 25.5, 26.5, 27.5]
     # The six hourly expectations add up to the stored 6-hour forecast of the same parameters.
     from src.common.seismo_models import omori_expected
@@ -195,3 +198,79 @@ def test_selectors_reset_when_the_data_source_changes(monkeypatch):
         6, "usgs-live", "7d", ["R-160_+60"], "us1", "usgs-live"
     )
     assert region_value == ["R-160_+60"] and main_value == "us1" and made_for == "usgs-live"
+
+
+def text_of(component) -> str:
+    """All text inside a Dash component tree."""
+    if component is None:
+        return ""
+    if isinstance(component, (str, int, float)):
+        return str(component)
+    if isinstance(component, (list, tuple)):
+        return " ".join(text_of(c) for c in component)
+    return text_of(getattr(component, "children", None))
+
+
+def test_forecast_summary_is_wrapping_html_with_the_generic_p_note_and_stale_warning():
+    t0 = datetime(2026, 11, 7, 11, 7, tzinfo=timezone.utc)
+    main = {"event_id": "us1", "event_time": t0, "magnitude": 5.5, "place": "74 km NE of Hasaki, Japan",
+            "source": "usgs-live", "active": True, "clock": t0 + timedelta(hours=40)}
+    forecast = {"k_value": 1.2, "c_value": 0.05, "p_value": 1.08, "r_squared": 0.1, "aftershock_count": 4,
+                "next_hour_rate": 0.01, "next_six_hour_expected": 0.08, "forecast_origin_hours": 40.0,
+                "p_estimated": False}
+    text = text_of(dash_app.forecast_summary(main, forecast))
+    assert "M5.5 74 km NE of Hasaki, Japan" in text
+    # The phrase QA saw clipped as "generic p=1.08 (under 5 afte" is complete.
+    assert "p = 1.08 (generic value: fewer than 5 aftershocks)" in text
+    assert "0.08 in the next 6 hours" in text and "after 2026-11-09 03:07 UTC" in text
+    assert "Not refitted" not in text and "Inactive" not in text
+
+    # The data moved on but the stored forecast did not: say so.
+    stale_main = {**main, "clock": t0 + timedelta(hours=42)}
+    assert "Not refitted since 2026-11-09 03:07 UTC" in text_of(dash_app.forecast_summary(stale_main, forecast))
+    assert "Inactive" in text_of(dash_app.forecast_summary({**main, "active": False}, forecast))
+    assert "No Omori" in text_of(dash_app.forecast_summary(None, None))
+
+
+def test_mainshock_list_marks_forecasts_that_were_not_refitted():
+    t0 = datetime(2026, 11, 2, 16, 49, tzinfo=timezone.utc)
+    clock = datetime(2026, 11, 9, 10, 23, tzinfo=timezone.utc)
+    options = pd.DataFrame({
+        "event_id": ["current", "stale", "old"],
+        "event_time": [t0, t0, t0],
+        "magnitude": [5.6, 5.3, 5.1],
+        "place": ["A", "Palekastro, Greece", "C"],
+        "source": ["usgs-live"] * 3,
+        "active": [True, True, False],
+        "next_six_hour_expected": [1.0, 0.02, 0.0],
+        "fitted_at": [None] * 3,
+        "forecast_start": [clock, clock - timedelta(hours=2), clock - timedelta(days=40)],
+        "clock": [clock] * 3,
+    })
+    opts, value = dash_app.pick_mainshock(options, None)
+    labels = [o["label"] for o in opts]
+    assert value == "current"
+    assert "(not refitted" not in labels[0] and "(inactive)" not in labels[0]
+    assert labels[1].endswith("(not refitted since 11-09 08:23)")
+    assert labels[2].endswith("(inactive)")
+
+
+def test_layout_uses_the_responsive_stylesheet():
+    css = Path(dash_app.ASSETS_FOLDER, "responsive.css").read_text(encoding="utf-8")
+    assert "@media (max-width: 640px)" in css and "minmax(min(100%, 420px), 1fr)" in css
+
+    def classes(component, found=None):
+        found = {} if found is None else found
+        if getattr(component, "id", None):
+            found[component.id] = getattr(component, "className", None)
+        children = getattr(component, "children", None)
+        for child in children if isinstance(children, (list, tuple)) else [children]:
+            if hasattr(child, "children") or getattr(child, "id", None):
+                classes(child, found)
+        return found
+
+    found = classes(dash_app.app.layout)
+    assert found["controls"] == "card controls-grid" and found["metrics"] == "metrics-grid"
+    assert found["forecast-summary"] == "forecast-summary"
+    # No fixed-width grid is left in inline styles (they caused the 519 px overflow on a phone).
+    assert "gridTemplateColumns" not in str(dash_app.app.layout)

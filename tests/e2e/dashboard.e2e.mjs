@@ -44,6 +44,9 @@ async function graph(id) {
     };
   }, id);
 }
+async function summary() {
+  return (await page.locator('#forecast-summary').innerText()).trim();
+}
 async function settle() {
   // Wait until Dash has no callback in flight.
   await page.waitForFunction(() => !document.querySelector('[data-dash-is-loading="true"]'), null, { timeout: 120000 });
@@ -111,10 +114,16 @@ check(
   replayB && `${replayB.traces.map((t) => `${t.name}:${t.n}`).join(', ')}; b-value windows=${replayBWindows}`,
 );
 const replayF = await graph('forecast-chart');
+const replaySummary = await summary();
 check(
   'replay demo: Omori-Utsu chart shows observed, fitted curve and 6 h forecast',
-  replayF && replayF.traces.length === 3 && /M5\.6/.test(replayF.title) && replayF.traces[2].n === 6,
-  replayF && `${replayF.title.split('<br>')[0]} | ${replayF.traces.map((t) => `${t.name}:${t.n}`).join(', ')}`,
+  replayF && replayF.traces.length === 3 && /M5\.6/.test(replaySummary) && replayF.traces[2].n === 6,
+  replayF && `${replaySummary.split('\n')[0]} | ${replayF.traces.map((t) => `${t.name}:${t.n}`).join(', ')}`,
+);
+check(
+  'replay demo: forecast summary gives the fit and the next-6-hour expectation',
+  /aftershocks within 300 km/.test(replaySummary) && /in the next 6 hours/.test(replaySummary) && !/Not refitted/.test(replaySummary),
+  replaySummary.replace(/\n/g, ' | '),
 );
 const mainshockLabel = await page.locator('#mainshock').innerText();
 check('replay demo: mainshock selector shows the M5.6 demo mainshock', /Demo M5\.6/.test(mainshockLabel), mainshockLabel.trim());
@@ -141,7 +150,20 @@ const liveMap = await graph('world-map');
 const liveEventTrace = liveMap && liveMap.traces.find((t) => t.name === 'Events');
 check('live mode: map plots the live events', liveEventTrace && liveEventTrace.n === Math.min(liveEvents, 5000), liveEventTrace && `points=${liveEventTrace.n}`);
 const liveF = await graph('forecast-chart');
-check('live mode: Omori-Utsu forecast panel renders', liveF !== null, liveF && liveF.title.split('<br>')[0]);
+const liveSummary = await summary();
+check('live mode: Omori-Utsu forecast panel renders', liveF !== null && liveSummary.length > 0, liveSummary.split('\n')[0]);
+const liveMainshockLabels = await (async () => {
+  await page.locator('#mainshock .Select-control').click();
+  const texts = await page.locator('#mainshock .VirtualizedSelectOption').allInnerTexts();
+  await page.keyboard.press('Escape');
+  return texts;
+})();
+check(
+  'live mode: no listed forecast is stale (every active mainshock is refitted)',
+  liveMainshockLabels.length > 0 && liveMainshockLabels.every((t) => !/not refitted/.test(t)),
+  `${liveMainshockLabels.length} mainshocks: ${liveMainshockLabels.slice(0, 3).join(' / ')}`,
+);
+await settle();
 await page.screenshot({ path: shot('03-live-usgs.png'), fullPage: true });
 
 // ---- Interactive controls
@@ -194,11 +216,11 @@ await page.locator('#mainshock').click();
 const options = page.locator('#mainshock .VirtualizedSelectOption');
 const nOptions = await options.count();
 if (nOptions > 1) {
-  const firstTitle = (await graph('forecast-chart')).title;
+  const firstTitle = (await summary()).split('\n')[0];
   await options.nth(1).click();
   await settle();
-  const secondTitle = (await graph('forecast-chart')).title;
-  check('mainshock selector switches the forecast', secondTitle !== firstTitle, `${firstTitle.split('<br>')[0]} -> ${secondTitle.split('<br>')[0]}`);
+  const secondTitle = (await summary()).split('\n')[0];
+  check('mainshock selector switches the forecast', secondTitle !== firstTitle, `${firstTitle} -> ${secondTitle}`);
 } else {
   await page.keyboard.press('Escape');
   check('mainshock selector lists live mainshocks', nOptions >= 1, `options=${nOptions}`);
@@ -226,6 +248,33 @@ const hover = await page.evaluate(() => {
   return t && (t.text || [])[0];
 });
 check('map points carry hover text', typeof hover === 'string' && hover.includes('M '), hover);
+
+// ---- Phone width: nothing wider than the screen, forecast text wraps instead of being clipped.
+const phone = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+phone.on('console', (m) => { if (m.type() === 'error') consoleErrors.push(m.text()); });
+await phone.goto(URL, { waitUntil: 'networkidle' });
+await phone.waitForSelector('#metric-events h2', { timeout: 120000 });
+await phone.getByLabel('Live USGS feed', { exact: true }).check();
+await phone.waitForFunction(() => document.querySelector('#forecast-summary') && document.querySelector('#forecast-summary').innerText.trim().length > 0, null, { timeout: 120000 });
+await phone.waitForTimeout(3000);
+const layout = await phone.evaluate(() => {
+  const doc = document.documentElement;
+  const wide = [...document.querySelectorAll('.page *')]
+    .filter((el) => el.getBoundingClientRect().right > window.innerWidth + 1 && !el.closest('.js-plotly-plot, #regions-table'))
+    .slice(0, 5)
+    .map((el) => `${el.tagName.toLowerCase()}#${el.id}.${String(el.className).slice(0, 30)}`);
+  const s = document.querySelector('#forecast-summary');
+  return {
+    overflow: doc.scrollWidth - window.innerWidth,
+    wide,
+    summaryClipped: s.scrollWidth > s.clientWidth + 1,
+    summaryRight: Math.round(s.getBoundingClientRect().right),
+  };
+});
+check('phone width (390 px): no horizontal page overflow', layout.overflow <= 0, `scrollWidth - innerWidth = ${layout.overflow}px; wider elements: ${layout.wide.join(', ') || 'none'}`);
+check('phone width: forecast summary wraps inside the screen', !layout.summaryClipped && layout.summaryRight <= 390, `right edge ${layout.summaryRight}px`);
+await phone.screenshot({ path: shot('06-phone.png'), fullPage: true });
+await phone.close();
 
 check('no failed Dash callbacks', callbackErrors.length === 0, callbackErrors.join('; '));
 check('no browser console errors', consoleErrors.length === 0, consoleErrors.slice(0, 3).join(' | '));
