@@ -1,46 +1,52 @@
 # Real-Time Seismic Activity Analysis and Aftershock Forecasting with Apache Spark and Kafka
 
-This is a runnable implementation of the DIS workshop idea from the abstract: a streaming seismic analytics system using the USGS real-time GeoJSON feed, Apache Kafka, Spark Structured Streaming, PostgreSQL, and a Plotly Dash dashboard.
+This is a runnable implementation of the DIS workshop idea from the abstract: a streaming seismic analytics system using the USGS real-time GeoJSON feed, Apache Kafka (KRaft), Spark Structured Streaming on a standalone cluster, PostgreSQL, and a Plotly Dash dashboard, all started with Docker Compose.
+
+For exact start, stop and test commands on Windows see **[RUNNING.md](RUNNING.md)**.
 
 ## What is implemented
 
 1. **Kafka streaming source**
-   - `src/producer/live_usgs_producer.py` polls the USGS `all_hour.geojson` feed.
-   - `src/producer/replay_producer.py` replays `data/replay_catalog/sample_replay_events.jsonl` at accelerated speed so the demo always shows meaningful clusters, b-value windows, and aftershock forecasts.
-   - Producers publish one JSON earthquake event per Kafka message to the `seismic-events` topic.
-   - Kafka replaces the previous file-based `data/incoming/` streaming source.
+   - `src/producer/live_usgs_producer.py` loads the USGS `all_week.geojson` feed once at start-up (backfill), then polls `all_hour.geojson` every 60 s and publishes only events it has not sent before.
+   - `src/producer/replay_producer.py` replays `data/replay_catalog/sample_replay_events.jsonl` (184 synthetic events: a Northern California `M5.6` sequence, events in Japan and Chile, background events). By default the catalogue is shifted in time so its last event happens "now", so the replay behaves like live data.
+   - 84 of those records are the original hand-made demo; the other 100 are aftershocks of the M5.6 added by `src/producer/extend_replay_catalog.py` (seeded; Omori-Utsu times with p = 1.08, Gutenberg-Richter magnitudes with b = 1.0 above M 2.0, within 20 km). They were added because the hand-made sequence alone has too few events for a 24-hour b-value with at least 20 events above Mc.
+   - Producers publish one JSON earthquake event per Kafka message (key = `event_id`) to the `seismic-events` topic. Each record carries `source` = `usgs-live` or `replay`.
 
-2. **Spark Structured Streaming job**
-   - `src/streaming/streaming_job.py` consumes Kafka messages with Spark's Kafka connector.
-   - Parses each Kafka message value as JSON using a fixed schema.
-   - Deduplicates by `event_id` using watermarking.
-   - Computes 1° × 1° spatial grid cells.
-   - Uses `foreachBatch` to write each micro-batch into PostgreSQL and run the analytics stages.
+2. **Spark Structured Streaming job** (`src/streaming/streaming_job.py`, submitted to the Spark master with 2 workers)
+   - Consumes Kafka with Spark's Kafka connector and parses each message with a fixed schema.
+   - Cleans (drops records without id or time, or with coordinates out of range), deduplicates by `event_id` across micro-batches (`dropDuplicatesWithinWatermark` with a 7-day event-time watermark, so the state stays bounded), and enriches with 1° × 1° grid cells and 10° × 10° regions.
+   - `foreachBatch` stores each micro-batch in PostgreSQL (idempotent on `event_id`) and runs the analytics below. Live and replay data are analysed separately (`source` is part of every window key).
 
-3. **Analytics**
-   - **Grid anomaly detection:** 6-hour windows, 1-hour step, z-score against historical per-cell baselines.
-   - **K-Means grouping:** flagged anomalous cells are clustered by centroid so nearby anomalies become active regions.
-   - **Gutenberg–Richter monitoring:** completeness magnitude `Mc` is estimated using maximum curvature, then b-value is estimated by maximum likelihood.
-   - **Omori–Utsu forecasting:** after a mainshock `M >= 5.0`, nearby aftershocks are used to fit `n(t) = K(t+c)^(-p)` and forecast the next-hour and next-six-hour rate.
+3. **Analytics** (`src/streaming/analytics.py`, `src/common/seismo_models.py`)
+   - **Sliding windows across micro-batches:** after each micro-batch, Spark reads back (JDBC) every stored event that can share a window with the batch and recomputes the windows the batch touched with `window(event_ts, ...)`. Windows therefore count events from earlier micro-batches and late events update the window they belong to; results are upserted.
+   - **Grid anomaly detection:** 6-hour windows sliding by 1 hour; z-score of the window count against the historical per-cell baseline (mean and standard deviation of 6-hour counts).
+   - **Historical baselines:** `src/batch/fetch_usgs_history.py` downloads 90 days of USGS earthquakes from the FDSN event service, and the Spark batch job `src/batch/compute_baselines.py` computes per-cell 6-hour rates (empty windows count as zero) and per-region long-term b-values. The shipped `data/baseline/*.csv` come from 32,544 USGS earthquakes between 2026-08-11 and 2026-11-09 (`data/baseline/baseline_metadata.json`).
+   - **K-Means active regions:** the cells flagged in the last 24 hours of data are clustered with Spark MLlib `KMeans` on the unit sphere; k grows until every cell lies within 300 km of its region centroid (at most 5 regions). Results are in `active_regions`.
+   - **Gutenberg–Richter monitoring:** 24-hour windows sliding by 1 hour per region; `Mc` by maximum curvature but never below the region's long-term Mc (so the window's b is comparable with the long-term b), b-value by Aki–Utsu maximum likelihood (σ = b/√n, at least 20 events above Mc). A window is an alert when |b − long-term b| > max(0.25, 2σ).
+   - **Omori–Utsu forecasting:** for each `M >= 5.0` mainshock active in the last 30 days, aftershocks within 300 km and 7 days are fitted by maximum likelihood to `n(t) = K(t+c)^(-p)` (c fixed at 0.05 days; p fixed at the generic 1.08 for sequences of 3–4 aftershocks), and the expected number of aftershocks in the next hour and next six hours after "now" is stored.
 
 4. **Storage and visualization**
-   - PostgreSQL tables are created by `sql/init.sql`.
-   - Dash dashboard shows:
-     - live world map with events, anomalous cells, and cluster centroids
-     - evolving b-value chart with error bars
-     - Omori–Utsu aftershock forecast chart
+   - PostgreSQL tables are created by `sql/init.sql` (the streaming job re-applies it on start, so older databases are upgraded).
+   - Dash dashboard (`src/dashboard/app.py`) with controls for data source (live, replay, both), time range, minimum magnitude, auto-refresh, b-value regions and mainshock. It shows:
+     - world map with events, anomalous grid cells and K-Means region centroids (hover for details)
+     - table of active seismic regions
+     - evolving b-value chart with error bars and alerts
+     - Omori–Utsu chart: observed aftershocks per hour, fitted decay curve and the six-hour forecast
 
 ## Project structure
 
 ```text
 .
-├── docker-compose.yml
-├── Dockerfile.spark
+├── docker-compose.yml          # project name cvfix-seismic; profiles app, replay, live, batch, test
+├── Dockerfile.spark            # one image for Spark master/workers, streaming job, producers, batch, tests
 ├── Dockerfile.dashboard
-├── requirements-spark.txt
-├── requirements-dashboard.txt
+├── requirements-spark.txt / requirements-dashboard.txt / requirements-test.txt
 ├── sql/init.sql
+├── scripts
+│   ├── start.ps1  stop.ps1  check.ps1  test.ps1  refresh_baselines.ps1   # Windows PowerShell
+│   └── reset_demo.sh  run_batch_baselines.sh                             # bash
 ├── src
+│   ├── batch/fetch_usgs_history.py
 │   ├── batch/compute_baselines.py
 │   ├── common/config.py
 │   ├── common/geo.py
@@ -49,184 +55,139 @@ This is a runnable implementation of the DIS workshop idea from the abstract: a 
 │   ├── dashboard/app.py
 │   ├── producer/live_usgs_producer.py
 │   ├── producer/replay_producer.py
+│   ├── producer/extend_replay_catalog.py   # adds the seeded synthetic aftershocks to the demo catalogue
+│   ├── streaming/analytics.py
 │   └── streaming/streaming_job.py
+├── tests
+│   ├── pipeline/               # pytest + local Spark (run in the Spark image)
+│   ├── dashboard/              # pytest (run in the dashboard image)
+│   └── e2e/dashboard.e2e.mjs   # headless browser check of the running dashboard
 └── data
-    ├── baseline/cell_baselines.csv
-    ├── baseline/region_bvalues.csv
-    ├── historical/sample_historical_events.csv
+    ├── baseline/cell_baselines.csv, region_bvalues.csv, baseline_metadata.json
+    ├── historical/usgs_historical_events.csv (+ .meta.json), sample_historical_events.csv (old synthetic sample)
     ├── replay_catalog/sample_replay_events.jsonl
     └── static/plate_boundaries_sample.geojson
 ```
 
 ## Requirements
 
-- Docker Desktop
-- Docker Compose v2
-- Internet access for the live USGS producer and initial image builds
+- Docker Desktop with Docker Compose v2 (about 6 GB of free memory for the containers)
+- Internet access for the image build, the Spark connector download on first start, and the USGS feeds
 
-No local Spark, Kafka, or PostgreSQL installation is required.
+No local Spark, Kafka, Python or PostgreSQL installation is required.
 
-## Fast demo using replay data
+## Quick start
 
-From the project root:
+Windows PowerShell (see RUNNING.md for details):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\start.ps1            # live USGS feed + replay demo
+powershell -ExecutionPolicy Bypass -File .\scripts\check.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\stop.ps1
+```
+
+Any shell:
 
 ```bash
 cp .env.example .env
-./scripts/reset_demo.sh --full
+docker compose --profile app --profile replay --profile live up --build -d
 ```
 
-On Windows PowerShell, use:
-
-```powershell
-Copy-Item .env.example .env
-Remove-Item data\checkpoints\seismic_stream -Recurse -Force -ErrorAction SilentlyContinue
-docker compose down -v --remove-orphans
-```
-
-Start Kafka, Spark, PostgreSQL, the streaming job, dashboard, and replay producer:
-
-```bash
-docker compose --profile app --profile replay up --build
-```
+Use only one producer with `--profile app --profile replay` or `--profile app --profile live`.
 
 Open:
 
-- Kafka broker: internal Docker address `kafka:9092`, host port `localhost:9092`
+- Dashboard: <http://localhost:8050>
 - Spark master UI: <http://localhost:8080>
 - Spark worker 1 UI: <http://localhost:8081>
 - Spark worker 2 UI: <http://localhost:8082>
-- Dashboard: <http://localhost:8050>
+- Kafka broker: internal Docker address `kafka:9092`, host port `localhost:9092`
+- PostgreSQL: `localhost:5432`, database, user and password `seismic`
 
-The replay producer sends 84 demo events into Kafka. The data includes a synthetic Northern California `M5.6` mainshock and aftershocks, so the dashboard should show anomalies and an Omori forecast.
-
-## Live USGS mode
-
-Use the real USGS feed instead of replay:
-
-```bash
-./scripts/reset_demo.sh --full
-docker compose --profile app --profile live up --build
-```
-
-The live feed can be quiet depending on current earthquake activity. Replay mode is better for a guaranteed class demo.
+The first micro-batch takes a few minutes on a fresh start (Spark downloads the Kafka and PostgreSQL connectors and warms up). The replay demo then shows anomalies in California, Japan and Chile, three K-Means regions, b-value windows and an Omori forecast for the M5.6 mainshock. The live feed shows whatever the USGS recorded in the last week.
 
 ## Kafka commands for checking the pipeline
 
-List topics:
+The Kafka tools are in `/opt/kafka/bin` inside the `kafka` container.
 
 ```bash
-docker compose exec kafka kafka-topics.sh --bootstrap-server kafka:9092 --list
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --describe --topic seismic-events
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server kafka:9092 \
+  --topic seismic-events --from-beginning --max-messages 5
 ```
 
-Describe the seismic topic:
-
-```bash
-docker compose exec kafka kafka-topics.sh --bootstrap-server kafka:9092 --describe --topic seismic-events
-```
-
-Read a few raw messages from the topic:
-
-```bash
-docker compose exec kafka kafka-console-consumer.sh \
-  --bootstrap-server kafka:9092 \
-  --topic seismic-events \
-  --from-beginning \
-  --max-messages 5
-```
+(In Git Bash on Windows, prefix these with `MSYS_NO_PATHCONV=1` so the `/opt/...` path is not rewritten.)
 
 ## Recompute historical baselines
 
-The repository already includes ready-to-use sample baselines. To recompute them from `data/historical/sample_historical_events.csv`:
-
-```bash
-./scripts/run_batch_baselines.sh
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\refresh_baselines.ps1
 ```
 
-Equivalent manual command:
-
-```bash
-docker compose up -d postgres spark-master spark-worker-1 spark-worker-2
-docker compose run --rm streaming-job bash -lc "spark-submit --master spark://spark-master:7077 src/batch/compute_baselines.py"
-```
+or `./scripts/run_batch_baselines.sh`, or directly `docker compose --profile batch run --rm baselines`. The job downloads `HISTORY_DAYS` (default 90) days of USGS earthquakes ending today, runs `compute_baselines.py` on the Spark cluster and rewrites `data/baseline/`. Restart the streaming job afterwards (`docker compose --profile app restart streaming-job`).
 
 ## Useful database checks
 
 ```bash
-docker compose exec postgres psql -U seismic -d seismic -c "SELECT COUNT(*) FROM seismic_events;"
-docker compose exec postgres psql -U seismic -d seismic -c "SELECT cell_id, event_count, z_score FROM anomaly_windows ORDER BY created_at DESC LIMIT 10;"
-docker compose exec postgres psql -U seismic -d seismic -c "SELECT region_id, b_value, b_sigma, is_alert FROM bvalue_windows ORDER BY created_at DESC LIMIT 10;"
-docker compose exec postgres psql -U seismic -d seismic -c "SELECT mainshock_id, p_value, next_six_hour_expected FROM aftershock_forecasts ORDER BY fitted_at DESC LIMIT 10;"
+docker compose exec postgres psql -U seismic -d seismic -c "SELECT source, COUNT(*) FROM seismic_events GROUP BY source;"
+docker compose exec postgres psql -U seismic -d seismic -c "SELECT source, cell_id, event_count, round(z_score::numeric,1) AS z FROM anomaly_windows ORDER BY z_score DESC LIMIT 10;"
+docker compose exec postgres psql -U seismic -d seismic -c "SELECT source, cluster_id, centroid_lon, centroid_lat, cells FROM active_regions;"
+docker compose exec postgres psql -U seismic -d seismic -c "SELECT source, region_id, window_end, b_value, b_sigma, is_alert FROM bvalue_windows ORDER BY window_end DESC LIMIT 10;"
+docker compose exec postgres psql -U seismic -d seismic -c "SELECT mainshock_id, aftershock_count, p_value, next_six_hour_expected FROM aftershock_forecasts ORDER BY fitted_at DESC LIMIT 10;"
 ```
+
+## Tests
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\test.ps1
+```
+
+runs `tests/pipeline` (geo, producers, the streaming ingest path with de-duplication across micro-batches, b-value and Omori models, sliding windows across micro-batches, baselines, K-Means) with a local SparkSession in the Spark image, and `tests/dashboard` in the dashboard image. `tests/e2e/dashboard.e2e.mjs` drives the running dashboard in headless Edge (see RUNNING.md).
 
 ## How the pipeline maps to the workshop abstract
 
 | Abstract requirement | Implementation |
 |---|---|
-| USGS Earthquake Hazards Real-Time GeoJSON feed | `live_usgs_producer.py` polls `all_hour.geojson` |
-| Replay source for deterministic demo | `replay_producer.py` publishes sample events to Kafka |
-| Message broker / streaming middleware | Kafka service in `docker-compose.yml`, topic `seismic-events` |
+| USGS Earthquake Hazards Real-Time GeoJSON feed | `live_usgs_producer.py` polls `all_hour.geojson` (after an `all_week.geojson` backfill) |
+| Replay source for deterministic demo | `replay_producer.py` publishes the sample catalogue to Kafka, shifted to the present |
+| Message broker / streaming middleware | Kafka (KRaft) service in `docker-compose.yml`, topic `seismic-events`, persistent volume |
 | Spark Structured Streaming source | `spark.readStream.format("kafka")` in `streaming_job.py` |
-| Deduplication by event ID | Producer state file for live mode + Spark `dropDuplicates(event_id)` |
-| Historical catalog baselines | `compute_baselines.py` and `data/baseline/cell_baselines.csv` |
+| Deduplication by event ID | Producer seen-ID state for live mode + Spark `dropDuplicatesWithinWatermark(event_id)` (7-day watermark) + `ON CONFLICT` in PostgreSQL |
+| Historical catalog baselines | `fetch_usgs_history.py` + `compute_baselines.py` → `data/baseline/cell_baselines.csv`, `region_bvalues.csv` |
 | 1° × 1° grid cells | `grid_lon`, `grid_lat`, `cell_id` fields |
-| 6-hour sliding windows | `window(event_ts, "6 hours", "1 hour")` |
-| Z-score anomaly detection | `compute_anomalies()` |
-| K-Means grouping of flagged cells | Spark MLlib `KMeans` in `compute_anomalies()` |
-| Gutenberg–Richter b-value monitoring | `compute_bvalues()` + `seismo_models.py` |
-| Omori–Utsu aftershock model | `compute_aftershock_forecasts()` + `fit_omori_utsu()` |
+| 6-hour sliding windows | `window(event_ts, "6 hours", "1 hour")` over stored events, recomputed per micro-batch |
+| Z-score anomaly detection | `score_anomalies()` in `analytics.py` |
+| K-Means grouping of flagged cells | Spark MLlib `KMeans` in `cluster_active_cells()` → `active_regions` |
+| Gutenberg–Richter b-value monitoring | `bvalue_rows()` + `seismo_models.py` |
+| Omori–Utsu aftershock model | `compute_aftershock_forecasts()` + `fit_omori_utsu()` (maximum likelihood) |
 | PostgreSQL sink after micro-batch | Spark `foreachBatch` writes with `psycopg2` |
 | Plotly Dash dashboard | `src/dashboard/app.py` |
 | Multi-node Spark cluster | Docker Compose: 1 master + 2 workers |
 
-## Notes for submission/demo
-
-Recommended screenshots:
-
-1. Docker Compose terminal showing Kafka, Spark master, two workers, PostgreSQL, streaming job, dashboard, and replay/live producer running.
-2. Kafka topic check showing `seismic-events` exists.
-3. Kafka console consumer showing raw JSON earthquake events being published.
-4. Spark master UI showing the submitted streaming application and two active workers.
-5. PostgreSQL query output showing non-empty `seismic_events`, `anomaly_windows`, `bvalue_windows`, and `aftershock_forecasts`.
-6. Dash world map showing recent events and highlighted anomalous grid cells.
-7. Dash b-value chart.
-8. Dash Omori–Utsu forecast chart.
-
 ## Troubleshooting
 
-### Spark fails with a Kafka connector error
+### Spark fails with a connector error
 
-The streaming job uses this package at submit time:
-
-```text
-org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.5
-```
-
-Make sure the machine has internet access the first time Docker builds/runs the Spark image so Spark can resolve the Kafka connector dependency.
+The streaming job resolves `org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.5` and `org.postgresql:postgresql:42.7.4` from Maven Central on its first start (cached afterwards in the `ivy-cache` volume). The machine needs internet access the first time.
 
 ### Dashboard starts before events appear
 
-The dashboard refreshes every 10 seconds. Wait until the replay producer has published a few Kafka messages and the streaming job logs a non-empty batch.
+The dashboard refreshes every 10 seconds. Wait until the streaming job logs `Batch N: received=...`.
 
-### No anomalies in live mode
+### No anomalies or forecasts in live mode
 
-This is normal if the live USGS feed is quiet. Use replay mode for a deterministic demo.
+This is normal when the live USGS feed is quiet; outside the US the feed lists mostly M4+ events, so few mainshocks have enough recorded aftershocks. Use replay mode for a deterministic demo.
 
 ### Resetting the demo
 
-Spark checkpointing remembers processed Kafka offsets. Kafka also stores topic messages in the `kafka-data` Docker volume, and PostgreSQL stores rows in the `pgdata` Docker volume.
-
-For a clean replay demo, run:
-
-```bash
-./scripts/reset_demo.sh --full
-```
-
-On Windows PowerShell:
+Kafka messages, PostgreSQL rows, Spark checkpoints and the live producer's seen-ID state are Docker volumes of the `cvfix-seismic` project, so they are always kept or removed together:
 
 ```powershell
-docker compose down -v --remove-orphans
-Remove-Item data\checkpoints\seismic_stream -Recurse -Force -ErrorAction SilentlyContinue
+powershell -ExecutionPolicy Bypass -File .\scripts\stop.ps1 -Reset
 ```
+
+(bash: `./scripts/reset_demo.sh`). The replay producer sends the same event IDs every time, so replaying again without a reset adds nothing new (they are deduplicated).
 
 ### Port conflicts
 

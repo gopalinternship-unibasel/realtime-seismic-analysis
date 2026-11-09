@@ -1,14 +1,18 @@
+Windows: RUNNING.md describes scripts\start.ps1, check.ps1, stop.ps1 and test.ps1, which wrap
+the commands below. In Git Bash, prefix commands that contain /opt/kafka/... with
+MSYS_NO_PATHCONV=1.
+
 1. SETUP AND CLEANUP COMMANDS
 -----------------------------
 
 Copy-Item .env.example .env
 Creates the .env file from the example configuration file.
 
-docker compose down -v --remove-orphans
-Stops all containers and removes old volumes/networks to start cleanly.
+docker compose --profile app --profile replay --profile live down -v --remove-orphans
+Stops all containers and removes this project's volumes (Kafka, PostgreSQL, checkpoints) to start cleanly.
 
-Remove-Item data\\checkpoints\\seismic_stream -Recurse -Force -ErrorAction SilentlyContinue
-Deletes old Spark checkpoint data so replay mode starts fresh.
+(Spark checkpoints live in the spark-checkpoints Docker volume, so "down -v" resets them
+together with Kafka and PostgreSQL. Old data\checkpoints folders must never be reused.)
 
 docker compose ps
 Shows which project containers are currently running.
@@ -52,26 +56,26 @@ Opens Spark Worker 2 UI.
 4. KAFKA COMMANDS
 -----------------
 
-docker compose exec kafka kafka-topics.sh --bootstrap-server kafka:9092 --list
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list
 Shows all Kafka topics, including seismic-events.
 
-docker compose exec kafka kafka-topics.sh --bootstrap-server kafka:9092 --describe --topic seismic-events
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --describe --topic seismic-events
 Shows topic details such as partitions and replication factor.
 
-docker compose exec kafka kafka-console-consumer.sh --bootstrap-server kafka:9092 --topic seismic-events --from-beginning --max-messages 5
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server kafka:9092 --topic seismic-events --from-beginning --max-messages 5
 Displays the first five raw earthquake event messages from Kafka.
 
-docker compose exec kafka kafka-console-consumer.sh --bootstrap-server kafka:9092 --topic seismic-events --from-beginning
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server kafka:9092 --topic seismic-events --from-beginning
 Continuously prints Kafka messages as they are consumed.
 
 
 5. SPARK COMMANDS
 -----------------
 
-docker compose logs streaming-job
+docker compose --profile app logs streaming-job
 Shows logs from the Spark Structured Streaming application.
 
-docker compose logs -f streaming-job
+docker compose --profile app logs -f streaming-job
 Continuously follows Spark logs while the streaming job runs.
 
 docker compose logs spark-master
@@ -87,13 +91,13 @@ Shows logs from Spark worker 2.
 6. PRODUCER COMMANDS
 --------------------
 
-docker compose logs replay-producer
+docker compose --profile app --profile replay logs replay-producer
 Shows whether the replay producer is sending synthetic earthquake events.
 
-docker compose logs -f replay-producer
+docker compose --profile app --profile replay logs -f replay-producer
 Continuously shows replay producer activity.
 
-docker compose logs live-producer
+docker compose --profile app --profile live logs live-producer
 Shows whether the live USGS producer is fetching earthquake events.
 
 
@@ -125,10 +129,10 @@ Lists all PostgreSQL tables created by the project.
 8. DASHBOARD COMMANDS
 ---------------------
 
-docker compose logs dashboard
+docker compose --profile app logs dashboard
 Shows whether the Dash dashboard started correctly.
 
-docker compose logs -f dashboard
+docker compose --profile app logs -f dashboard
 Continuously shows dashboard logs.
 
 
@@ -141,10 +145,10 @@ Shows whether each service is running or exited.
 docker compose ps -a
 Shows all containers, including stopped or failed ones.
 
-docker compose restart dashboard
+docker compose --profile app restart dashboard
 Restarts only the dashboard service.
 
-docker compose restart streaming-job
+docker compose --profile app restart streaming-job
 Restarts only the Spark streaming job.
 
 
@@ -167,21 +171,21 @@ Shows all running distributed services.
 
 3. List Kafka topics:
 
-docker compose exec kafka kafka-topics.sh --bootstrap-server kafka:9092 --list
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list
 
 Description:
 Proves that Kafka has created the seismic-events topic.
 
 4. Show raw Kafka messages:
 
-docker compose exec kafka kafka-console-consumer.sh --bootstrap-server kafka:9092 --topic seismic-events --from-beginning --max-messages 5
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server kafka:9092 --topic seismic-events --from-beginning --max-messages 5
 
 Description:
 Shows raw earthquake event messages flowing through Kafka.
 
 5. Follow Spark streaming logs:
 
-docker compose logs -f streaming-job
+docker compose --profile app logs -f streaming-job
 
 Description:
 Shows Spark processing streaming micro-batches.

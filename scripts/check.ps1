@@ -1,0 +1,58 @@
+<#
+.SYNOPSIS
+  Show that every stage of the pipeline works: containers, Kafka topic and messages,
+  Spark cluster and streaming application, PostgreSQL tables per data source, dashboard.
+
+.EXAMPLE
+  powershell -ExecutionPolicy Bypass -File .\scripts\check.ps1
+#>
+$ErrorActionPreference = 'Continue'
+Set-Location (Split-Path -Parent $PSScriptRoot)
+$profiles = @('--profile', 'app', '--profile', 'replay', '--profile', 'live')
+
+$envFile = @{}
+if (Test-Path .env) {
+    Get-Content .env | Where-Object { $_ -match '^\s*([A-Z_]+)\s*=\s*(.*)$' } | ForEach-Object {
+        $null = $_ -match '^\s*([A-Z_]+)\s*=\s*(.*)$'; $envFile[$Matches[1]] = $Matches[2].Trim()
+    }
+}
+$dbUser = if ($envFile['POSTGRES_USER']) { $envFile['POSTGRES_USER'] } else { 'seismic' }
+$dbName = if ($envFile['POSTGRES_DB']) { $envFile['POSTGRES_DB'] } else { 'seismic' }
+$topic = if ($envFile['KAFKA_TOPIC']) { $envFile['KAFKA_TOPIC'] } else { 'seismic-events' }
+
+Write-Host '== Containers'
+& docker compose @profiles ps -a --format 'table {{.Service}}\t{{.Status}}'
+
+Write-Host "`n== Kafka topic '$topic' (partition:offset = messages per partition)"
+& docker compose exec -T kafka /opt/kafka/bin/kafka-get-offsets.sh --bootstrap-server kafka:9092 --topic $topic
+
+Write-Host "`n== Two raw Kafka messages"
+& docker compose exec -T kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server kafka:9092 --topic $topic --from-beginning --max-messages 2 --timeout-ms 20000 2>$null
+
+Write-Host "`n== Spark cluster (http://localhost:8080)"
+try {
+    $master = Invoke-RestMethod -Uri 'http://localhost:8080/json/' -TimeoutSec 10
+    Write-Host ("  status={0}  alive workers={1}  cores={2}" -f $master.status, $master.aliveworkers, $master.cores)
+    foreach ($app in $master.activeapps) { Write-Host ("  running application: {0} ({1}, {2} cores)" -f $app.name, $app.id, $app.cores) }
+} catch { Write-Warning "Spark master UI not reachable: $_" }
+
+Write-Host "`n== Latest streaming micro-batches"
+(& docker compose --profile app logs --no-log-prefix streaming-job 2>$null) | Select-String -Pattern 'Batch \d+: received=' | Select-Object -Last 3 | ForEach-Object { Write-Host "  $($_.Line)" }
+
+Write-Host "`n== PostgreSQL rows per data source"
+$sql = @"
+SELECT 'seismic_events' AS table_name, source, COUNT(*) AS rows FROM seismic_events GROUP BY source
+UNION ALL SELECT 'anomaly_windows', source, COUNT(*) FROM anomaly_windows GROUP BY source
+UNION ALL SELECT 'active_regions', source, COUNT(*) FROM active_regions GROUP BY source
+UNION ALL SELECT 'bvalue_windows', source, COUNT(*) FROM bvalue_windows GROUP BY source
+UNION ALL SELECT 'mainshocks', source, COUNT(*) FROM mainshocks GROUP BY source
+UNION ALL SELECT 'aftershock_forecasts', m.source, COUNT(*) FROM aftershock_forecasts f JOIN mainshocks m ON m.event_id = f.mainshock_id GROUP BY m.source
+ORDER BY 1, 2;
+"@
+& docker compose exec -T postgres psql -U $dbUser -d $dbName -c $sql
+
+Write-Host "`n== Dashboard"
+try {
+    $r = Invoke-WebRequest -Uri 'http://localhost:8050/' -UseBasicParsing -TimeoutSec 10
+    Write-Host "  http://localhost:8050 -> HTTP $($r.StatusCode)"
+} catch { Write-Warning "Dashboard not reachable: $_" }
