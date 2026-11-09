@@ -143,3 +143,23 @@ def test_kmeans_respects_max_k(spark):
     cells = [cell(f"{lon}:0") for lon in (-150, -90, -30, 30, 90, 150)]
     _assignment, regions = cluster_active_cells(spark, cells, max_k=3, radius_km=300)
     assert len(regions) == 3
+
+
+def test_bvalue_mc_is_never_below_the_regional_long_term_mc(spark):
+    # One day with a burst of tiny events (M0.0-0.3) and a normal tail (M1.7-3.4), as in an
+    # Alaska window on 9 Nov 2026: maximum curvature puts Mc at 0.0, far below the regional 1.7.
+    tiny = [0.0] * 8 + [0.1] * 5 + [0.2] * 4 + [0.3] * 3
+    tail = [round(1.7 + 0.1 * (i % 18), 1) for i in range(30)]
+    batch = events(spark, [(f"t{i}", i, m, "-152:57") for i, m in enumerate(tiny + tail)])
+    grouped = bvalue_window_magnitudes(batch, batch).collect()
+
+    unfloored = bvalue_rows(grouped, {"R-160_+50": 0.79}, 1, min_events=20)
+    assert unfloored and {r[6] for r in unfloored} == {0.0}
+
+    floored = bvalue_rows(grouped, {"R-160_+50": 0.79}, 1, min_events=20, mc_floor={"R-160_+50": 1.7})
+    assert floored and {r[6] for r in floored} == {1.7}
+    assert {r[5] for r in floored} == {30}  # only the magnitudes at or above 1.7 are used
+    # A floor below the window's own Mc changes nothing.
+    assert bvalue_rows(grouped, {}, 1, min_events=20, mc_floor={"R-160_+50": -1.0}) == bvalue_rows(
+        grouped, {}, 1, min_events=20
+    )

@@ -121,15 +121,25 @@ def bvalue_window_magnitudes(recent_events: DataFrame, batch_events: DataFrame) 
 
 
 def bvalue_rows(
-    grouped_rows: Iterable, long_term: dict[str, float], batch_id: int, min_events: int = 20
+    grouped_rows: Iterable,
+    long_term: dict[str, float],
+    batch_id: int,
+    min_events: int = 20,
+    mc_floor: dict[str, float] | None = None,
 ) -> list[tuple]:
     """Gutenberg-Richter b-value (Mc by maximum curvature, b by maximum likelihood) per window.
 
     Windows with fewer than ``min_events`` magnitudes at or above Mc are skipped: with
     sigma = b / sqrt(n), five events give sigma of about half of b and b-values of 3 to 8
     that would raise false alerts.
+
+    ``mc_floor`` maps a region to its long-term completeness magnitude. A window's Mc is
+    never set below it: a burst of tiny events in one day can move the maximum curvature
+    far below what the network records completely (Mc near 0 against a long-term 1.7 in
+    Alaska), and a b-value above a lower Mc is not comparable with the long-term b.
     """
     rows = []
+    floors = mc_floor or {}
     for row in grouped_rows:
         magnitudes = [float(m) for m in row["magnitudes"] if m is not None]
         if len(magnitudes) < max(5, min_events):
@@ -137,6 +147,9 @@ def bvalue_rows(
         mc = estimate_completeness_magnitude(magnitudes)
         if mc is None:
             continue
+        floor = floors.get(row["region_id"])
+        if floor is not None and floor > mc:
+            mc = float(floor)
         b_value, b_sigma, n_above = estimate_b_value(magnitudes, mc)
         if b_value is None or b_sigma is None or n_above < min_events:
             continue

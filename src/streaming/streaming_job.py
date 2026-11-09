@@ -225,7 +225,8 @@ def upsert_anomalies(
     return len(rows)
 
 
-def load_long_term_bvalues(path: str) -> dict[str, float]:
+def load_region_values(path: str, column: str) -> dict[str, float]:
+    """region_id -> value of ``column`` from region_bvalues.csv (empty when the file or column is missing)."""
     if not os.path.exists(path):
         return {}
     result: dict[str, float] = {}
@@ -233,7 +234,7 @@ def load_long_term_bvalues(path: str) -> dict[str, float]:
         header = f.readline().strip().split(",")
         try:
             region_idx = header.index("region_id")
-            b_idx = header.index("long_term_b")
+            b_idx = header.index(column)
         except ValueError:
             return {}
         for line in f:
@@ -247,15 +248,30 @@ def load_long_term_bvalues(path: str) -> dict[str, float]:
     return result
 
 
+def load_long_term_bvalues(path: str) -> dict[str, float]:
+    return load_region_values(path, "long_term_b")
+
+
+def load_long_term_mc(path: str) -> dict[str, float]:
+    return load_region_values(path, "completeness_mag")
+
+
 def upsert_bvalues(
     recent: DataFrame,
     quakes: DataFrame,
     long_term: dict[str, float],
+    long_term_mc: dict[str, float],
     batch_id: int,
     cfg: StreamConfig,
     pg_config: PostgresConfig,
 ) -> int:
-    rows = bvalue_rows(bvalue_window_magnitudes(recent, quakes).collect(), long_term, batch_id, cfg.bvalue_min_events)
+    rows = bvalue_rows(
+        bvalue_window_magnitudes(recent, quakes).collect(),
+        long_term,
+        batch_id,
+        cfg.bvalue_min_events,
+        mc_floor=long_term_mc,
+    )
     if not rows:
         return 0
     sql = """
@@ -481,6 +497,7 @@ def process_batch(
     spark: SparkSession,
     baseline_df: DataFrame,
     long_term_b: dict[str, float],
+    long_term_mc: dict[str, float],
     cfg: StreamConfig,
     pg_config: PostgresConfig,
 ) -> None:
@@ -518,7 +535,7 @@ def process_batch(
         ).cache()
         anomaly_count = upsert_anomalies(recent, quakes, baseline_df, batch_id, cfg, pg_config)
         t = lap("anomalies", t)
-        bvalue_count = upsert_bvalues(recent, quakes, long_term_b, batch_id, cfg, pg_config)
+        bvalue_count = upsert_bvalues(recent, quakes, long_term_b, long_term_mc, batch_id, cfg, pg_config)
         t = lap("bvalues", t)
         recent.unpersist()
 
@@ -584,9 +601,11 @@ def main() -> int:
     )
     baseline_df = spark.read.schema(baseline_schema).option("header", True).csv(cfg.baseline_csv).cache()
     long_term_b = load_long_term_bvalues(cfg.region_bvalue_csv)
+    long_term_mc = load_long_term_mc(cfg.region_bvalue_csv)
     print(
         f"Loaded {baseline_df.count()} cell baselines from {cfg.baseline_csv} and "
-        f"{len(long_term_b)} regional b-values from {cfg.region_bvalue_csv}",
+        f"{len(long_term_b)} regional b-values (with {len(long_term_mc)} completeness magnitudes) "
+        f"from {cfg.region_bvalue_csv}",
         flush=True,
     )
 
@@ -604,7 +623,7 @@ def main() -> int:
 
     query = (
         stream_df.writeStream.foreachBatch(
-            lambda df, bid: process_batch(df, bid, spark, baseline_df, long_term_b, cfg, pg_config)
+            lambda df, bid: process_batch(df, bid, spark, baseline_df, long_term_b, long_term_mc, cfg, pg_config)
         )
         .outputMode("append")
         .option("checkpointLocation", cfg.checkpoint_dir)
