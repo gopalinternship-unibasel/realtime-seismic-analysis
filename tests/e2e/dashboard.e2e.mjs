@@ -13,6 +13,8 @@ const shotDir = process.env.SCREENSHOT_DIR || path.join(here, 'screenshots');
 fs.mkdirSync(shotDir, { recursive: true });
 const shot = (name) => path.join(shotDir, name);
 const URL = process.env.DASH_URL || 'http://localhost:8050/';
+// data/replay_catalog/sample_replay_events.jsonl: 84 hand-made records + 100 generated aftershocks.
+const REPLAY_EVENTS = 184;
 const results = [];
 const check = (name, ok, detail = '') => {
   results.push({ name, ok: !!ok, detail });
@@ -52,6 +54,18 @@ async function chooseSource(label) {
   await page.getByLabel(label, { exact: true }).check();
   await settle();
 }
+async function waitForGraph(id, predicate, timeout = 60000) {
+  // Poll a Plotly figure until it matches (callbacks can take a few seconds when the CPU is busy).
+  const start = Date.now();
+  let last = null;
+  while (Date.now() - start < timeout) {
+    last = await graph(id);
+    if (last && predicate(last)) return last;
+    await page.waitForTimeout(1000);
+  }
+  return last;
+}
+const regionsOf = (g) => (g ? [...new Set(g.traces.map((t) => t.name.replace(/ alert$/, '')))] : []);
 async function waitForMetric(id, predicate, timeout = 90000) {
   const start = Date.now();
   while (Date.now() - start < timeout) {
@@ -68,14 +82,14 @@ check('dashboard loads with title', (await page.title()) === 'Real-Time Seismic 
 
 // ---- Both sources (default)
 const bothEvents = await metric('metric-events');
-check('events from both sources are shown', bothEvents > 84, `events=${bothEvents}`);
+check('events from both sources are shown', bothEvents > REPLAY_EVENTS, `events=${bothEvents}`);
 await page.screenshot({ path: shot('01-both-sources.png'), fullPage: true });
 
 // ---- Replay demo
 await chooseSource('Replay demo');
-await waitForMetric('metric-events', (v) => v === 84);
+await waitForMetric('metric-events', (v) => v === REPLAY_EVENTS);
 const replayEvents = await metric('metric-events');
-check('replay demo: 84 events stored and shown', replayEvents === 84, `events=${replayEvents}`);
+check(`replay demo: ${REPLAY_EVENTS} events stored and shown`, replayEvents === REPLAY_EVENTS, `events=${replayEvents}`);
 const replayCells = await metric('metric-anomalous-cells');
 const replayRegions = await metric('metric-active-regions');
 check('replay demo: anomalous cells flagged by z-score', replayCells > 0, `cells=${replayCells}`);
@@ -89,8 +103,13 @@ check(
   replayMap && replayMap.traces.map((t) => `${t.name}:${t.n}`).join(', '),
 );
 const replayB = await graph('bvalue-chart');
-const replayRegionsShown = replayB ? new Set(replayB.traces.map((t) => t.name.replace(/ alert$/, ''))).size : 0;
-check('replay demo: b-value chart shows every replay region with windows (up to 4)', replayRegionsShown >= 2, replayB && replayB.traces.map((t) => `${t.name}:${t.n}`).join(', '));
+const replayMainRegion = replayB && replayB.traces.find((t) => t.name === 'R-130_+30');
+const replayBWindows = await metric('metric-bvalue-windows');
+check(
+  'replay demo: b-value chart follows the M5.6 sequence region (R-130_+30)',
+  replayMainRegion && replayMainRegion.n >= 10 && replayBWindows >= replayMainRegion.n,
+  replayB && `${replayB.traces.map((t) => `${t.name}:${t.n}`).join(', ')}; b-value windows=${replayBWindows}`,
+);
 const replayF = await graph('forecast-chart');
 check(
   'replay demo: Omori-Utsu chart shows observed, fitted curve and 6 h forecast',
@@ -103,14 +122,21 @@ await page.screenshot({ path: shot('02-replay-demo.png'), fullPage: true });
 
 // ---- Live USGS feed
 await chooseSource('Live USGS feed');
-await waitForMetric('metric-events', (v) => v !== 84);
+await waitForMetric('metric-events', (v) => v !== REPLAY_EVENTS);
+// The replay's region selection must give way to the live defaults (busiest regions first).
+await waitForGraph('bvalue-chart', (g) => regionsOf(g).length > 1);
 const liveEvents = await metric('metric-events');
 check('live mode: real USGS events shown', liveEvents > 100, `events=${liveEvents}`);
 const liveWindows = await metric('metric-bvalue-windows');
 check('live mode: b-value windows computed from live data', liveWindows > 0, `bvalue windows=${liveWindows}`);
 const liveB = await graph('bvalue-chart');
-const liveRegionsShown = liveB ? new Set(liveB.traces.map((t) => t.name.replace(/ alert$/, ''))).size : 0;
-check('live mode: b-value chart shows the 4 busiest regions', liveRegionsShown === 4, liveB && liveB.traces.map((t) => `${t.name}:${t.n}`).join(', '));
+const liveRegionsShown = regionsOf(liveB).length;
+const liveSelected = await page.locator('#bvalue-regions .Select-value').count();
+check(
+  'live mode: b-value chart shows the busiest live regions (up to 4), not the replay selection',
+  liveRegionsShown >= 2 && liveRegionsShown <= 4 && liveSelected === liveRegionsShown,
+  liveB && `${liveB.traces.map((t) => `${t.name}:${t.n}`).join(', ')}; selected=${liveSelected}`,
+);
 const liveMap = await graph('world-map');
 const liveEventTrace = liveMap && liveMap.traces.find((t) => t.name === 'Events');
 check('live mode: map plots the live events', liveEventTrace && liveEventTrace.n === Math.min(liveEvents, 5000), liveEventTrace && `points=${liveEventTrace.n}`);
@@ -138,19 +164,28 @@ await page.locator('#time-range').click();
 await page.getByText('Last 7 days', { exact: true }).click();
 await settle();
 
-// Region selector for the b-value chart: clear, then pick one region.
+// Freeze the view while the selectors are worked (auto-refresh is tested below).
+await page.getByLabel(/every 10 s/).uncheck();
+await settle();
+
+// Region selector for the b-value chart: clear it, then pick the region listed first.
 const before = await graph('bvalue-chart');
-await page.locator('#bvalue-regions .Select-clear').click().catch(() => {});
+await page.locator('#bvalue-regions .Select-clear').click();
 await settle();
-await page.locator('#bvalue-regions input').fill('R-160');
-await page.keyboard.press('Enter');
+const cleared = await waitForGraph('bvalue-chart', (g) => g.traces.length === 0);
+check('region selector can be cleared', cleared && cleared.traces.length === 0, `traces=${cleared && cleared.traces.length}`);
+await page.locator('#bvalue-regions .Select-control').click();
+const regionOption = page.locator('#bvalue-regions .VirtualizedSelectOption').first();
+const pickedRegion = (await regionOption.innerText()).trim().split(/\s+/)[0];
+// (no Escape afterwards: react-select clears the whole value on Escape once its menu is closed)
+await regionOption.click();
 await settle();
-const afterRegion = await graph('bvalue-chart');
+const afterRegion = await waitForGraph('bvalue-chart', (g) => regionsOf(g).length === 1 && regionsOf(g)[0] === pickedRegion);
 const regionNames = afterRegion ? afterRegion.traces.map((t) => t.name).filter((n) => !/alert$/.test(n)) : [];
 check(
   'region selector changes the b-value chart',
-  regionNames.length >= 1 && regionNames.every((n) => n.startsWith('R-160')),
-  `before=[${before && before.traces.map((t) => t.name).join(', ')}] after=[${regionNames.join(', ')}]`,
+  regionNames.length === 1 && regionNames[0] === pickedRegion,
+  `before=[${before && before.traces.map((t) => t.name).join(', ')}] picked=${pickedRegion} after=[${regionNames.join(', ')}]`,
 );
 await page.screenshot({ path: shot('04-region-selected.png'), fullPage: true });
 
@@ -171,6 +206,8 @@ if (nOptions > 1) {
 await page.screenshot({ path: shot('05-mainshock-selected.png'), fullPage: true });
 
 // Auto-refresh: on by default (timestamp moves), off stops it.
+await page.getByLabel(/every 10 s/).check();
+await settle();
 const stamp1 = await page.locator('#last-updated').innerText();
 await page.waitForTimeout(12000);
 const stamp2 = await page.locator('#last-updated').innerText();

@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from dash import Dash, Input, Output, State, ctx, dcc, html
+from dash import Dash, Input, Output, State, dcc, html
 from sqlalchemy import create_engine, text
 
 from src.common.seismo_models import (
@@ -464,6 +464,8 @@ app.layout = html.Div(
             ]
         ),
         dcc.Interval(id="refresh", interval=REFRESH_MS, n_intervals=0),
+        # The data source the region and mainshock selections were made for.
+        dcc.Store(id="selector-source"),
         controls,
         html.Div(
             id="metrics",
@@ -528,7 +530,9 @@ def pick_regions(options: pd.DataFrame, current: list[str] | None) -> tuple[list
     ]
     valid = {o["value"] for o in opts}
     kept = [v for v in (current or []) if v in valid]
-    if not kept:
+    # Defaults on first load (None) or when every chosen region has gone; a selection the
+    # user cleared on purpose ([]) stays empty so the next refresh does not refill it.
+    if not kept and (current is None or len(current) > 0):
         kept = [o["value"] for o in opts[:DEFAULT_REGIONS]]
     return opts, kept
 
@@ -553,20 +557,25 @@ def pick_mainshock(options: pd.DataFrame, current: str | None) -> tuple[list[dic
     Output("bvalue-regions", "value"),
     Output("mainshock", "options"),
     Output("mainshock", "value"),
+    Output("selector-source", "data"),
     Input("refresh", "n_intervals"),
     Input("source", "value"),
     Input("time-range", "value"),
     State("bvalue-regions", "value"),
     State("mainshock", "value"),
+    State("selector-source", "data"),
 )
-def update_selectors(_n, source, time_range, current_regions, current_mainshock):
+def update_selectors(_n, source, time_range, current_regions, current_mainshock, selections_source):
     sources = selected_sources(source)
-    if ctx.triggered_id == "source":
+    if selections_source != source:
         # A different data source has different regions and mainshocks: start from its defaults.
+        # Comparing with the stored source (not just "the source radio triggered this") also
+        # covers an auto-refresh that fires while the source change is still in flight, which
+        # used to win and keep the previous source's selection.
         current_regions, current_mainshock = None, None
     region_opts, region_value = pick_regions(load_bvalue_region_options(sources, time_range), current_regions)
     main_opts, main_value = pick_mainshock(load_mainshock_options(sources), current_mainshock)
-    return region_opts, region_value, main_opts, main_value
+    return region_opts, region_value, main_opts, main_value, source
 
 
 @app.callback(

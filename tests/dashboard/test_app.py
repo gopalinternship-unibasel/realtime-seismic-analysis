@@ -66,6 +66,10 @@ def test_region_selection_survives_refresh_and_defaults_to_busiest():
     assert default == ["R-130_+30", "R-160_+50", "R+140_+30", "R-080_-40"]
     _opts, kept = dash_app.pick_regions(options, ["R+120_+20", "gone"])
     assert kept == ["R+120_+20"]
+    # Every chosen region gone (e.g. a shorter time range): back to the defaults.
+    assert dash_app.pick_regions(options, ["gone"])[1] == default
+    # Cleared by the user: stays empty across refreshes.
+    assert dash_app.pick_regions(options, [])[1] == []
 
 
 def test_forecast_chart_shows_observations_fit_and_forecast():
@@ -155,3 +159,39 @@ def test_bvalue_chart_marks_alerts():
     )
     fig = dash_app.build_bvalue_chart(bvalues)
     assert len(fig.data) == 2 and fig.data[1].name.endswith("alert")
+
+
+def test_selectors_reset_when_the_data_source_changes(monkeypatch):
+    regions = {
+        "replay": pd.DataFrame({"region_id": ["R-130_+30"], "windows": [33], "alerts": [0], "max_events": [122]}),
+        "usgs-live": pd.DataFrame(
+            {"region_id": ["R-120_+30", "R-130_+30", "R-160_+60"], "windows": [133, 114, 27], "alerts": [3, 14, 0],
+             "max_events": [101, 35, 26]}
+        ),
+    }
+    mainshocks = {
+        "replay": pd.DataFrame({"event_id": ["demo"], "event_time": [datetime(2026, 11, 8, tzinfo=timezone.utc)],
+                                "magnitude": [5.6], "place": ["Demo"], "source": ["replay"], "active": [True],
+                                "next_six_hour_expected": [8.5], "fitted_at": [None]}),
+        "usgs-live": pd.DataFrame({"event_id": ["us1"], "event_time": [datetime(2026, 11, 7, tzinfo=timezone.utc)],
+                                   "magnitude": [5.5], "place": ["Japan"], "source": ["usgs-live"], "active": [True],
+                                   "next_six_hour_expected": [0.08], "fitted_at": [None]}),
+    }
+    monkeypatch.setattr(dash_app, "load_bvalue_region_options", lambda sources, _t: regions[sources[0]])
+    monkeypatch.setattr(dash_app, "load_mainshock_options", lambda sources: mainshocks[sources[0]])
+    # The function behind the Dash callback (Dash wraps it to read the request context).
+    update_selectors = getattr(dash_app.update_selectors, "__wrapped__", dash_app.update_selectors)
+
+    # Selections made for the replay; an auto-refresh after switching to live (the radio's own
+    # callback still in flight) must not keep them: live gets its own defaults.
+    _ro, region_value, _mo, main_value, made_for = update_selectors(
+        5, "usgs-live", "7d", ["R-130_+30"], "demo", "replay"
+    )
+    assert region_value == ["R-120_+30", "R-130_+30", "R-160_+60"]
+    assert main_value == "us1" and made_for == "usgs-live"
+
+    # Same source: the user's choice survives the refresh.
+    _ro, region_value, _mo, main_value, made_for = update_selectors(
+        6, "usgs-live", "7d", ["R-160_+60"], "us1", "usgs-live"
+    )
+    assert region_value == ["R-160_+60"] and main_value == "us1" and made_for == "usgs-live"
