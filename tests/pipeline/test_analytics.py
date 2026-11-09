@@ -143,8 +143,11 @@ def test_kmeans_respects_max_k_and_flags_the_regions_it_could_not_fit(spark):
     cells = [cell(f"{lon}:0") for lon in (-150, -90, -30, 30, 90, 150)]
     _assignment, regions = cluster_active_cells(spark, cells, max_k=3, radius_km=300)
     assert len(regions) == 3
-    # Three regions cannot hold six spots 60 degrees apart within 300 km: every region says so.
-    assert all(r.radius_km > 300 and r.within_radius is False for r in regions)
+    # Three regions cannot hold six spots 60 degrees apart within 300 km: the wide ones say so
+    # (K-Means may still leave a single spot alone in a region, which is within the radius).
+    assert all(r.within_radius == (r.radius_km <= 300) for r in regions)
+    assert sum(not r.within_radius for r in regions) >= 1
+    assert sum(len(r.cells) for r in regions if not r.within_radius) >= 4
 
 
 def test_more_than_five_separate_hot_spots_each_get_a_region_within_the_radius(spark):
