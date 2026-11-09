@@ -14,7 +14,7 @@ class PostgresConfig:
     def dsn(self) -> str:
         return (
             f"host={self.host} port={self.port} dbname={self.db} "
-            f"user={self.user} password={self.password}"
+            f"user={self.user} password={self.password} options='-c TimeZone=UTC'"
         )
 
     @property

@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import time
 from contextlib import closing
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import psycopg2
@@ -154,12 +154,24 @@ def write_mainshock_rows(rows: list, pg_config: PostgresConfig, min_magnitude: f
     return len(mainshock_rows)
 
 
+def utc_iso(value: datetime) -> str:
+    """ISO text with an explicit +00:00 offset for SQL.
+
+    PySpark's collect() returns naive datetimes in the driver's local time zone, which is UTC
+    in the containers (no TZ is set). Without the offset, PostgreSQL would read the literal in
+    the JDBC session's time zone (the JVM default), and psycopg2 writes go through the
+    TimeZone=UTC session option in PostgresConfig.dsn.
+    """
+    value = value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+    return value.isoformat()
+
+
 def load_stored_events(spark: SparkSession, pg_config: PostgresConfig, lo, hi) -> DataFrame:
     """Read the stored earthquakes in [lo, hi) back from PostgreSQL with Spark's JDBC source."""
     query = (
         "SELECT event_id, event_time AS event_ts, magnitude, cell_id, grid_lon, grid_lat, region_id, source "
         "FROM seismic_events "
-        f"WHERE event_time >= TIMESTAMPTZ '{lo.isoformat()}' AND event_time < TIMESTAMPTZ '{hi.isoformat()}' "
+        f"WHERE event_time >= TIMESTAMPTZ '{utc_iso(lo)}' AND event_time < TIMESTAMPTZ '{utc_iso(hi)}' "
         "AND COALESCE(LOWER(event_type), 'earthquake') = 'earthquake'"
     )
     return (
