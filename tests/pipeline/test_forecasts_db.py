@@ -71,6 +71,11 @@ def latest_forecasts():
     return {r[0]: (r[1], r[2], r[3]) for r in rows}
 
 
+def runs():
+    """source -> (clock, batch_id, mainshocks, forecasts) of the latest forecast run."""
+    return {r[0]: tuple(r[1:]) for r in query("SELECT source, clock, batch_id, mainshocks, forecasts FROM forecast_runs")}
+
+
 def isolated_sequences(n, t_last, source="usgs-live"):
     """n M5.2 mainshocks 15 degrees of longitude apart (1,600 km), one per hour, each with 3 aftershocks."""
     rows = []
@@ -101,6 +106,8 @@ def test_every_active_mainshock_gets_a_current_forecast_not_only_the_newest_20(d
         count, origin, batch_id = second[main_id]
         assert batch_id == 2 and count == 3
         assert math.isclose(origin, (clock_rows[0][0] - main_time).total_seconds() / 3600.0, abs_tol=1e-3)
+    # The run's clock is stored with it: the dashboard compares each forecast's start with it.
+    assert runs()["usgs-live"] == (clock_rows[0][0], 2, 25, 25)
 
 
 def test_unchanged_forecasts_are_not_stored_again(db):
@@ -112,6 +119,20 @@ def test_unchanged_forecasts_are_not_stored_again(db):
     store([event("replay-x", NOW + timedelta(hours=5), 2.0, 0.0, 0.0, "replay")])
     assert streaming_job.compute_aftershock_forecasts(3, CFG, PG) == (3, 0)
     assert query("SELECT COUNT(*) FROM aftershock_forecasts")[0][0] == 3
+    # Every run is recorded per source, also a source without mainshocks and a run that stored nothing.
+    recorded = runs()
+    assert recorded["usgs-live"] == (NOW + timedelta(minutes=30), 3, 3, 3)  # the last aftershock
+    assert recorded["replay"] == (NOW + timedelta(hours=5), 3, 0, 0)
+
+
+def test_a_batch_run_again_after_a_restart_overwrites_its_own_forecast_rows(db):
+    store(isolated_sequences(1, NOW))
+    assert streaming_job.compute_aftershock_forecasts(7, CFG, PG) == (1, 1)
+    # The job was stopped before batch 7 was committed; the batch is run again with one more aftershock.
+    store([event("usgs-live-a00-late", NOW + timedelta(minutes=45), 3.1, -169.9, -40.0, "usgs-live")])
+    assert streaming_job.compute_aftershock_forecasts(7, CFG, PG) == (1, 1)
+    rows = query("SELECT batch_id, aftershock_count FROM aftershock_forecasts")
+    assert rows == [(7, 4)]  # the old ON CONFLICT DO NOTHING kept the 3-aftershock fit
 
 
 def test_a_large_sequence_is_forecast_once_for_its_largest_event(db):
@@ -139,6 +160,8 @@ def test_a_large_sequence_is_forecast_once_for_its_largest_event(db):
     assert larger["fore"] == "m7"  # a foreshock is part of the sequence too
     assert all(larger[f"m5-{i:02d}"] == "m7" for i in range(25))
     assert sum(1 for k, v in larger.items() if k.startswith("other-") and v is None) == 30
+    # 31 mainshocks (the M7.0 and the 30 others) were tried; only the M7.0 has aftershocks.
+    assert runs()["replay"][2:] == (31, 1)
 
 
 def test_aftershocks_across_the_antimeridian_and_far_east_at_high_latitude_are_counted(db):

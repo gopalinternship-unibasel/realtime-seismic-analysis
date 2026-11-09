@@ -258,6 +258,23 @@ def test_mainshock_list_marks_forecasts_that_were_not_refitted():
     assert labels[2].endswith("(inactive)")
 
 
+def test_stale_means_older_than_the_latest_forecast_run_not_the_newest_event():
+    run_clock = pd.Timestamp("2026-11-09 10:23:00", tz="UTC")
+    # The origin is stored to 4 decimals of an hour, so a current forecast can start 0.18 s off the clock.
+    assert not dash_app.is_stale(run_clock - pd.Timedelta(seconds=0.18), run_clock)
+    assert not dash_app.is_stale(run_clock + pd.Timedelta(seconds=0.18), run_clock)
+    assert dash_app.is_stale(run_clock - pd.Timedelta(minutes=2), run_clock)
+    # No run recorded yet (a database from before forecast_runs): nothing is marked.
+    assert not dash_app.is_stale(run_clock - pd.Timedelta(hours=2), None)
+    assert not dash_app.is_stale(run_clock - pd.Timedelta(hours=2), run_clock, active=False)
+    # The dashboard reads the run clock from forecast_runs, not MAX(event_time): new events stored
+    # by a micro-batch that is still running would otherwise mark every forecast of the source.
+    import inspect
+    for fn in (dash_app.load_mainshock_options, dash_app.load_forecast_detail):
+        source = inspect.getsource(fn)
+        assert "forecast_runs" in source and "MAX(event_time)" not in source
+
+
 def test_layout_uses_the_responsive_stylesheet():
     css = Path(dash_app.ASSETS_FOLDER, "responsive.css").read_text(encoding="utf-8")
     assert "@media (max-width: 640px)" in css and "minmax(min(100%, 420px), 1fr)" in css

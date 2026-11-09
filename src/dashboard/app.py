@@ -49,8 +49,10 @@ TIME_RANGE_OPTIONS = [
 ]
 DEFAULT_REGIONS = 4
 CLUSTER_COLORS = ["#d62728", "#1f77b4", "#2ca02c", "#9467bd", "#ff7f0e", "#8c564b", "#e377c2", "#17becf"]
-# A forecast whose start is more than this before its source's latest event was not refitted.
-STALE_FORECAST_SECONDS = 60
+# A forecast whose start is more than this before its source's clock in forecast_runs (the data
+# clock of the latest forecast run) was not refitted in that run. The stored origin is rounded to
+# 4 decimals of an hour (at most 0.18 s off), so 1 s is enough.
+STALE_FORECAST_SECONDS = 1
 
 # The page layout (cards, responsive grids) is in assets/responsive.css.
 ASSETS_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
@@ -222,7 +224,9 @@ def forecast_start_time(mainshock: dict, forecast: dict) -> pd.Timestamp | None:
 
 
 def is_stale(start, clock, active: bool = True) -> bool:
-    """An active mainshock's forecast is stale when it starts before its source's latest event."""
+    """An active mainshock's forecast is stale when it starts before the clock of its source's latest
+    forecast run (forecast_runs). Not the newest event: that moves as soon as a micro-batch stores
+    new events, while the forecasts of that batch are fitted at its end."""
     if not active or start is None or clock is None or pd.isna(start) or pd.isna(clock):
         return False
     return (pd.Timestamp(clock) - pd.Timestamp(start)).total_seconds() > STALE_FORECAST_SECONDS
@@ -269,7 +273,7 @@ def forecast_summary(mainshock: dict | None, forecast: dict | None) -> list:
     elif is_stale(start, clock):
         lines.append(
             html.Div(
-                f"Not refitted since {start:%Y-%m-%d %H:%M} UTC although the data now runs to "
+                f"Not refitted since {start:%Y-%m-%d %H:%M} UTC: the latest forecast run used the data up to "
                 f"{pd.Timestamp(clock):%Y-%m-%d %H:%M} UTC.",
                 className="forecast-warning",
             )
@@ -398,22 +402,21 @@ def load_mainshock_options(sources: list[str]) -> pd.DataFrame:
 
     M >= 5 events that belong to the sequence of a larger event (larger_event_id set by the
     streaming job) are not listed: the larger event's forecast covers them. forecast_start and
-    clock (the source's latest event) let the list mark a forecast that was not refitted.
+    clock (the data clock of the source's latest forecast run) let the list mark a forecast that
+    was not refitted in that run.
     """
     return query_df(
         """
         SELECT m.event_id, m.event_time, m.magnitude, m.place, m.source, m.active,
                f.next_six_hour_expected, f.fitted_at,
                m.event_time + make_interval(secs => f.forecast_origin_hours * 3600) AS forecast_start,
-               c.clock
+               r.clock
         FROM mainshocks m
         JOIN LATERAL (
             SELECT next_six_hour_expected, fitted_at, forecast_origin_hours FROM aftershock_forecasts af
             WHERE af.mainshock_id = m.event_id ORDER BY af.fitted_at DESC, af.id DESC LIMIT 1
         ) f ON TRUE
-        LEFT JOIN (
-            SELECT source, MAX(event_time) AS clock FROM seismic_events WHERE source = ANY(:sources) GROUP BY source
-        ) c ON c.source = m.source
+        LEFT JOIN forecast_runs r ON r.source = m.source
         WHERE m.source = ANY(:sources) AND m.larger_event_id IS NULL
         ORDER BY m.active DESC, m.event_time DESC
         LIMIT 200
@@ -426,7 +429,7 @@ def load_forecast_detail(mainshock_id: str) -> tuple[dict | None, dict | None, l
     mainshock = query_df(
         """
         SELECT m.event_id, m.event_time, m.magnitude, m.longitude, m.latitude, m.place, m.source, m.active,
-               (SELECT MAX(event_time) FROM seismic_events s WHERE s.source = m.source) AS clock
+               (SELECT r.clock FROM forecast_runs r WHERE r.source = m.source) AS clock
         FROM mainshocks m WHERE m.event_id = :id
         """,
         {"id": mainshock_id},

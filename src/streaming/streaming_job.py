@@ -465,6 +465,10 @@ def compute_aftershock_forecasts(batch_id: int, cfg: StreamConfig, pg_config: Po
 
     A new row is stored only when the fit differs from the mainshock's latest stored one (the
     clock moved or aftershocks arrived), so the latest row of every mainshock is always current.
+    The clock each source was forecast at is stored in forecast_runs, in the same transaction:
+    a forecast that does not start at its source's run clock was not refitted (the dashboard
+    marks it). Comparing with the newest event instead would mark every forecast while a
+    micro-batch that brought new events is still running.
     Returns (mainshocks with a forecast, rows stored).
     """
     with closing(pg_connect(pg_config)) as conn, conn, conn.cursor() as cur:
@@ -479,20 +483,24 @@ def compute_aftershock_forecasts(batch_id: int, cfg: StreamConfig, pg_config: Po
             (cfg.mainshock_active_days,),
         )
         decluster_mainshocks(cur)
+        cur.execute("SELECT source, MAX(event_time) FROM seismic_events GROUP BY source")
+        clocks = {source: clock for source, clock in cur.fetchall() if clock is not None}
         cur.execute(
             """
-            SELECT m.event_id, m.event_time, m.magnitude, m.longitude, m.latitude, m.source, c.clock
-            FROM mainshocks m
-            JOIN (SELECT source, MAX(event_time) AS clock FROM seismic_events GROUP BY source) c
-              ON c.source = m.source
-            WHERE m.active = TRUE AND m.larger_event_id IS NULL
-            ORDER BY m.event_time DESC
+            SELECT event_id, event_time, magnitude, longitude, latitude, source
+            FROM mainshocks
+            WHERE active = TRUE AND larger_event_id IS NULL
+            ORDER BY event_time DESC
             """
         )
-        mainshocks = cur.fetchall()
+        mainshocks = [row for row in cur.fetchall() if row[5] in clocks]
 
         fitted: dict[str, tuple] = {}
-        for main_id, main_time, main_mag, main_lon, main_lat, source, clock in mainshocks:
+        mainshocks_per_source: dict[str, int] = {}
+        fitted_per_source: dict[str, int] = {}
+        for main_id, main_time, main_mag, main_lon, main_lat, source in mainshocks:
+            clock = clocks[source]
+            mainshocks_per_source[source] = mainshocks_per_source.get(source, 0) + 1
             cur.execute(
                 AFTERSHOCK_CANDIDATES_SQL,
                 (source, main_time, main_time, AFTERSHOCK_WINDOW_DAYS, main_mag, *search_box_params(main_lon, main_lat)),
@@ -504,30 +512,50 @@ def compute_aftershock_forecasts(batch_id: int, cfg: StreamConfig, pg_config: Po
             fit = fit_omori_utsu(hours_after, forecast_from_hours=elapsed_hours, observed_until_hours=observed_hours)
             if fit is not None:
                 fitted[main_id] = tuple(getattr(fit, f) for f in FORECAST_FIELDS)
+                fitted_per_source[source] = fitted_per_source.get(source, 0) + 1
 
-        if not fitted:
-            return 0, 0
-        cur.execute(
-            f"""
-            SELECT DISTINCT ON (mainshock_id) mainshock_id, {", ".join(FORECAST_FIELDS)}
-            FROM aftershock_forecasts
-            WHERE mainshock_id = ANY(%s)
-            ORDER BY mainshock_id, fitted_at DESC, id DESC
-            """,
-            (list(fitted),),
-        )
-        latest = {row[0]: tuple(row[1:]) for row in cur.fetchall()}
-        forecast_rows = [(batch_id, main_id, *values) for main_id, values in fitted.items() if latest.get(main_id) != values]
+        forecast_rows: list[tuple] = []
+        if fitted:
+            cur.execute(
+                f"""
+                SELECT DISTINCT ON (mainshock_id) mainshock_id, {", ".join(FORECAST_FIELDS)}
+                FROM aftershock_forecasts
+                WHERE mainshock_id = ANY(%s)
+                ORDER BY mainshock_id, fitted_at DESC, id DESC
+                """,
+                (list(fitted),),
+            )
+            latest = {row[0]: tuple(row[1:]) for row in cur.fetchall()}
+            forecast_rows = [
+                (batch_id, main_id, *values) for main_id, values in fitted.items() if latest.get(main_id) != values
+            ]
         if forecast_rows:
+            # A micro-batch that is run again after a restart keeps its batch_id: overwrite its rows.
+            updates = ", ".join(f"{f} = EXCLUDED.{f}" for f in FORECAST_FIELDS)
             execute_values(
                 cur,
                 f"""
                 INSERT INTO aftershock_forecasts (batch_id, mainshock_id, {", ".join(FORECAST_FIELDS)})
                 VALUES %s
-                ON CONFLICT (batch_id, mainshock_id) DO NOTHING
+                ON CONFLICT (batch_id, mainshock_id) DO UPDATE SET {updates}, fitted_at = now()
                 """,
                 forecast_rows,
                 page_size=100,
+            )
+        if clocks:
+            execute_values(
+                cur,
+                """
+                INSERT INTO forecast_runs (source, clock, batch_id, mainshocks, forecasts, finished_at)
+                VALUES %s
+                ON CONFLICT (source) DO UPDATE SET clock = EXCLUDED.clock, batch_id = EXCLUDED.batch_id,
+                    mainshocks = EXCLUDED.mainshocks, forecasts = EXCLUDED.forecasts, finished_at = now()
+                """,
+                [
+                    (source, clock, batch_id, mainshocks_per_source.get(source, 0), fitted_per_source.get(source, 0))
+                    for source, clock in clocks.items()
+                ],
+                template="(%s, %s, %s, %s, %s, now())",
             )
     return len(fitted), len(forecast_rows)
 

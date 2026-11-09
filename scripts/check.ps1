@@ -55,6 +55,18 @@ ORDER BY 1, 2;
 "@
 & docker compose exec -T postgres psql -U $dbUser -d $dbName -c $sql
 
+Write-Host "`n== Omori-Utsu forecasts per data source (latest forecast run; stale = active mainshock not refitted in it)"
+$sql = @"
+SELECT r.source, r.clock AS run_clock, r.batch_id, r.mainshocks, r.forecasts,
+       (SELECT COUNT(*) FROM mainshocks m
+        JOIN LATERAL (SELECT forecast_origin_hours FROM aftershock_forecasts f WHERE f.mainshock_id = m.event_id
+                      ORDER BY f.fitted_at DESC, f.id DESC LIMIT 1) f ON TRUE
+        WHERE m.source = r.source AND m.active AND m.larger_event_id IS NULL
+          AND m.event_time + make_interval(secs => f.forecast_origin_hours * 3600) < r.clock - interval '1 second') AS stale
+FROM forecast_runs r ORDER BY 1;
+"@
+& docker compose exec -T postgres psql -U $dbUser -d $dbName -c $sql
+
 Write-Host "`n== Dashboard"
 try {
     $r = Invoke-WebRequest -Uri 'http://localhost:8050/' -UseBasicParsing -TimeoutSec 10

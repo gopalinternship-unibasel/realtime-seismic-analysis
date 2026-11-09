@@ -146,3 +146,15 @@ ALTER TABLE aftershock_forecasts ADD COLUMN IF NOT EXISTS forecast_origin_hours 
 ALTER TABLE aftershock_forecasts ADD COLUMN IF NOT EXISTS p_estimated BOOLEAN NOT NULL DEFAULT TRUE;
 
 CREATE INDEX IF NOT EXISTS idx_forecasts_mainshock_time ON aftershock_forecasts(mainshock_id, fitted_at DESC);
+
+-- The data clock (latest event time) each source was last forecast at, written in the same
+-- transaction as the forecasts. An active mainshock whose latest forecast starts before its
+-- source's clock here was not refitted in the latest run; the dashboard marks it.
+CREATE TABLE IF NOT EXISTS forecast_runs (
+    source TEXT PRIMARY KEY,
+    clock TIMESTAMPTZ NOT NULL,
+    batch_id BIGINT NOT NULL,
+    mainshocks INTEGER NOT NULL,
+    forecasts INTEGER NOT NULL,
+    finished_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
