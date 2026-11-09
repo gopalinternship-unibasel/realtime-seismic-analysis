@@ -69,15 +69,16 @@ Write-Host '(the first start downloads the Kafka and PostgreSQL connectors, whic
 $batches = @()
 $crashed = $false
 while ((Get-Date) -lt $deadline) {
-    $log = @(& docker compose --profile app logs --no-log-prefix streaming-job 2>$null)
-    # Only the lines since the job's latest start: a restarted container keeps its older logs.
-    $from = -1
-    for ($i = $log.Count - 1; $i -ge 0; $i--) { if ($log[$i] -match 'Streaming from Kafka') { $from = $i; break } }
-    if ($from -ge 0) {
-        $batches = @($log[$from..($log.Count - 1)] | Where-Object { $_ -match '^Batch \d+:' })
+    # Only the log lines of the job's current run: a restarted container keeps its older logs,
+    # so read them from the container's latest start (it changes if the job restarts itself).
+    $jobId = (& docker compose --profile app ps -q streaming-job 2>$null | Select-Object -First 1)
+    $startedAt = if ($jobId) { (& docker inspect -f '{{.State.StartedAt}}' $jobId 2>$null) } else { $null }
+    if ($startedAt) {
+        $log = @(& docker compose --profile app logs --no-log-prefix --since $startedAt streaming-job 2>$null)
+        $batches = @($log | Where-Object { $_ -match '^Batch \d+:' })
         if ($batches.Count -gt 0) { break }
+        if (@($log | Select-Object -Last 40) -match 'Traceback') { $crashed = $true; break }
     }
-    if (@($log | Select-Object -Last 40) -match 'Traceback') { $crashed = $true; break }
     Start-Sleep -Seconds 5
 }
 if ($batches.Count -gt 0) {
