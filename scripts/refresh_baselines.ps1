@@ -21,7 +21,13 @@ $ErrorActionPreference = 'Continue'
 Set-Location (Split-Path -Parent $PSScriptRoot)
 
 $started = Get-Date
-& docker compose --profile batch run --rm baselines
+# Start the Spark cluster only if it is not running, and never recreate it: "docker compose run"
+# with its dependencies recreates spark-master and the workers whenever Compose thinks they
+# diverged (seen on 9 Nov 2026 after start.ps1 had rebuilt the image), which cut the running
+# streaming job off from its executors until it was restarted.
+& docker compose up -d --no-recreate spark-master spark-worker-1 spark-worker-2
+if ($LASTEXITCODE -ne 0) { throw "Starting the Spark cluster failed (exit $LASTEXITCODE)" }
+& docker compose --profile batch run --rm --no-deps baselines
 if ($LASTEXITCODE -ne 0) { throw "Baseline job failed (exit $LASTEXITCODE)" }
 Get-Content data\baseline\baseline_metadata.json
 Write-Host ("Baselines recomputed in {0:N0} s" -f ((Get-Date) - $started).TotalSeconds)

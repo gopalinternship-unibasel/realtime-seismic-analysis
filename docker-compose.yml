@@ -251,7 +251,9 @@ services:
       retries: 12
 
   # One-off batch job: download USGS history and recompute the baselines on the Spark cluster.
-  #   docker compose --profile batch run --rm baselines
+  #   docker compose --profile batch run --rm --no-deps baselines   (cluster already up; see
+  #   scripts/refresh_baselines.ps1, which starts it with --no-recreate so a running streaming
+  #   job keeps its master and executors)
   baselines:
     <<: *spark-image
     profiles: ["batch"]
