@@ -224,6 +224,9 @@ def test_forecast_summary_is_wrapping_html_with_the_generic_p_note_and_stale_war
     assert "p = 1.08 (generic value: fewer than 5 aftershocks)" in text
     assert "0.08 in the next 6 hours" in text and "after 2026-11-09 03:07 UTC" in text
     assert "Not refitted" not in text and "Inactive" not in text
+    # The origin is stored to 4 decimals of an hour: 6.2047 h after 04:47:43 is 10:59:59.9, shown as 11:00.
+    near = {**main, "event_time": datetime(2026, 11, 9, 4, 47, 43, tzinfo=timezone.utc)}
+    assert "after 2026-11-09 11:00 UTC" in text_of(dash_app.forecast_summary(near, {**forecast, "forecast_origin_hours": 6.2047}))
 
     # The data moved on but the stored forecast did not: say so.
     stale_main = {**main, "clock": t0 + timedelta(hours=42)}

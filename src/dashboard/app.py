@@ -217,7 +217,8 @@ def forecast_start_time(mainshock: dict, forecast: dict) -> pd.Timestamp | None:
     origin = forecast.get("forecast_origin_hours")
     if origin is None or pd.isna(origin):
         return None
-    return pd.Timestamp(mainshock["event_time"]) + pd.Timedelta(hours=float(origin))
+    # origin is stored to 4 decimals of an hour (0.36 s): round so 10:59:59.99 shows as 11:00.
+    return (pd.Timestamp(mainshock["event_time"]) + pd.Timedelta(hours=float(origin))).round("s")
 
 
 def is_stale(start, clock, active: bool = True) -> bool:
@@ -612,7 +613,7 @@ def pick_mainshock(options: pd.DataFrame, current: str | None) -> tuple[list[dic
         if not r.active:
             return " (inactive)"
         start, clock = getattr(r, "forecast_start", None), getattr(r, "clock", None)
-        return f" (not refitted since {pd.Timestamp(start):%m-%d %H:%M})" if is_stale(start, clock) else ""
+        return f" (not refitted since {pd.Timestamp(start).round('s'):%m-%d %H:%M})" if is_stale(start, clock) else ""
 
     opts = [
         {
