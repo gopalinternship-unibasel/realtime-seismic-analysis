@@ -134,6 +134,10 @@ services:
     <<: *spark-image
     profiles: ["app"]
     restart: on-failure
+    # On "docker compose stop" the Spark driver gets SIGTERM and stops its SparkContext
+    # (executors, Kafka consumer, a micro-batch in flight). That took longer than the default
+    # 10 s on a busy machine, which ended in SIGKILL (exit 137). Give it time to exit by itself.
+    stop_grace_period: 90s
     depends_on:
       postgres:
         condition: service_healthy
