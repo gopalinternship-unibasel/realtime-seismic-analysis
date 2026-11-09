@@ -115,9 +115,14 @@ CREATE TABLE IF NOT EXISTS mainshocks (
     place TEXT,
     source TEXT NOT NULL DEFAULT 'unknown',
     active BOOLEAN NOT NULL DEFAULT TRUE,
+    -- Set when a larger M >= 5 event of the same source lies within 300 km and 7 days of this
+    -- one (this event is its aftershock or foreshock). Only rows with NULL here are forecast.
+    larger_event_id TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE mainshocks ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'unknown';
+ALTER TABLE mainshocks ADD COLUMN IF NOT EXISTS larger_event_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_mainshocks_source_time ON mainshocks(source, event_time DESC);
 
 CREATE TABLE IF NOT EXISTS aftershock_forecasts (
     id BIGSERIAL PRIMARY KEY,

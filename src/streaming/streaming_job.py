@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import time
 from contextlib import closing
@@ -23,7 +24,9 @@ from src.common.seismo_models import (
     AFTERSHOCK_RADIUS_KM,
     AFTERSHOCK_WINDOW_DAYS,
     aftershock_hours,
+    find_larger_events,
     fit_omori_utsu,
+    search_box_params,
 )
 from src.streaming.analytics import (
     MAX_WINDOW_HOURS,
@@ -394,13 +397,76 @@ def refresh_active_regions(spark: SparkSession, batch_id: int, cfg: StreamConfig
     return total
 
 
-def compute_aftershock_forecasts(batch_id: int, cfg: StreamConfig, pg_config: PostgresConfig) -> int:
-    """Fit Omori-Utsu to the aftershocks of every active mainshock and store the forecast.
+AFTERSHOCK_CANDIDATES_SQL = """
+    SELECT event_time, longitude, latitude
+    FROM seismic_events
+    WHERE source = %s
+      AND event_time > %s
+      AND event_time <= %s + make_interval(days => %s)
+      AND magnitude < %s
+      AND COALESCE(LOWER(event_type), 'earthquake') = 'earthquake'
+      AND latitude BETWEEN %s AND %s
+      AND (longitude BETWEEN %s AND %s OR longitude BETWEEN %s AND %s)
+    ORDER BY event_time ASC
+"""
 
-    "Now" is each source's data clock (its latest event time), so a replayed
-    catalogue is forecast on its own timeline just like the live feed.
+# The stored forecast values, in the order of the aftershock_forecasts columns after mainshock_id.
+FORECAST_FIELDS = (
+    "aftershock_count",
+    "k_value",
+    "c_value",
+    "p_value",
+    "next_hour_rate",
+    "next_six_hour_expected",
+    "r_squared",
+    "forecast_origin_hours",
+    "p_estimated",
+)
+
+
+def decluster_mainshocks(cur, window_days: float = AFTERSHOCK_WINDOW_DAYS) -> None:
+    """Store, for every active M >= 5 event, the larger event of its sequence (NULL: it is a mainshock).
+
+    Without this, each M5 aftershock of a large event was forecast as a mainshock of its own and
+    counted the rest of the large event's sequence as its aftershocks.
     """
-    inserted = 0
+    cur.execute(
+        """
+        SELECT event_id, source, event_time, magnitude, longitude, latitude, active, larger_event_id
+        FROM mainshocks
+        WHERE event_time >= (SELECT MIN(event_time) FROM mainshocks WHERE active) - make_interval(days => %s)
+        """,
+        (int(math.ceil(window_days)),),
+    )
+    rows = cur.fetchall()
+    larger = find_larger_events([row[:6] for row in rows], AFTERSHOCK_RADIUS_KM, window_days)
+    # Only active rows: every event that can be larger and near an active one was loaded above.
+    changed = [(larger[row[0]], row[0]) for row in rows if row[6] and larger[row[0]] != row[7]]
+    if changed:
+        execute_values(
+            cur,
+            """
+            UPDATE mainshocks AS m SET larger_event_id = v.larger_id::text
+            FROM (VALUES %s) AS v(larger_id, event_id)
+            WHERE m.event_id = v.event_id
+            """,
+            changed,
+        )
+
+
+def compute_aftershock_forecasts(batch_id: int, cfg: StreamConfig, pg_config: PostgresConfig) -> tuple[int, int]:
+    """Fit Omori-Utsu to the aftershocks of every active mainshock and store the forecasts that changed.
+
+    Every active mainshock is fitted, of every source (there used to be a LIMIT 20 on the newest
+    ones, so older mainshocks, often the main event of a busy sequence, kept a stale forecast or
+    never got one). M >= 5 events that belong to the sequence of a larger event are not mainshocks
+    (see decluster_mainshocks). "Now" is each source's data clock (its latest event time), so a
+    replayed catalogue is forecast on its own timeline just like the live feed.
+
+    A new row is stored only when the fit differs from the mainshock's latest stored one (the
+    clock moved or aftershocks arrived), so the latest row of every mainshock is always current.
+    Returns (mainshocks with a forecast, rows stored).
+    """
     with closing(pg_connect(pg_config)) as conn, conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -412,83 +478,58 @@ def compute_aftershock_forecasts(batch_id: int, cfg: StreamConfig, pg_config: Po
             """,
             (cfg.mainshock_active_days,),
         )
+        decluster_mainshocks(cur)
         cur.execute(
             """
-            SELECT m.event_id, m.event_time, m.magnitude, m.longitude, m.latitude, m.source,
-                   (SELECT MAX(event_time) FROM seismic_events s WHERE s.source = m.source) AS clock
+            SELECT m.event_id, m.event_time, m.magnitude, m.longitude, m.latitude, m.source, c.clock
             FROM mainshocks m
-            WHERE m.active = TRUE
+            JOIN (SELECT source, MAX(event_time) AS clock FROM seismic_events GROUP BY source) c
+              ON c.source = m.source
+            WHERE m.active = TRUE AND m.larger_event_id IS NULL
             ORDER BY m.event_time DESC
-            LIMIT 20
             """
         )
         mainshocks = cur.fetchall()
 
-        forecast_rows = []
+        fitted: dict[str, tuple] = {}
         for main_id, main_time, main_mag, main_lon, main_lat, source, clock in mainshocks:
             cur.execute(
-                """
-                SELECT event_time, longitude, latitude
-                FROM seismic_events
-                WHERE source = %s
-                  AND event_time > %s
-                  AND event_time <= %s + make_interval(days => %s)
-                  AND magnitude < %s
-                  AND COALESCE(LOWER(event_type), 'earthquake') = 'earthquake'
-                  AND longitude BETWEEN %s AND %s
-                  AND latitude BETWEEN %s AND %s
-                ORDER BY event_time ASC
-                """,
-                (
-                    source,
-                    main_time,
-                    main_time,
-                    AFTERSHOCK_WINDOW_DAYS,
-                    main_mag,
-                    main_lon - 4.0,
-                    main_lon + 4.0,
-                    main_lat - 4.0,
-                    main_lat + 4.0,
-                ),
+                AFTERSHOCK_CANDIDATES_SQL,
+                (source, main_time, main_time, AFTERSHOCK_WINDOW_DAYS, main_mag, *search_box_params(main_lon, main_lat)),
             )
             hours_after = aftershock_hours(main_time, main_lon, main_lat, cur.fetchall(), AFTERSHOCK_RADIUS_KM)
-            elapsed_hours = (clock - main_time).total_seconds() / 3600.0 if clock is not None else None
+            elapsed_hours = (clock - main_time).total_seconds() / 3600.0
             # Aftershocks are only collected for AFTERSHOCK_WINDOW_DAYS, so that is the longest observed span.
-            observed_hours = None if elapsed_hours is None else min(elapsed_hours, AFTERSHOCK_WINDOW_DAYS * 24.0)
+            observed_hours = min(elapsed_hours, AFTERSHOCK_WINDOW_DAYS * 24.0)
             fit = fit_omori_utsu(hours_after, forecast_from_hours=elapsed_hours, observed_until_hours=observed_hours)
-            if fit is None:
-                continue
-            forecast_rows.append(
-                (
-                    batch_id,
-                    main_id,
-                    fit.aftershock_count,
-                    fit.k_value,
-                    fit.c_value,
-                    fit.p_value,
-                    fit.next_hour_rate,
-                    fit.next_six_hour_expected,
-                    fit.r_squared,
-                    fit.forecast_origin_hours,
-                    fit.p_estimated,
-                )
-            )
+            if fit is not None:
+                fitted[main_id] = tuple(getattr(fit, f) for f in FORECAST_FIELDS)
 
+        if not fitted:
+            return 0, 0
+        cur.execute(
+            f"""
+            SELECT DISTINCT ON (mainshock_id) mainshock_id, {", ".join(FORECAST_FIELDS)}
+            FROM aftershock_forecasts
+            WHERE mainshock_id = ANY(%s)
+            ORDER BY mainshock_id, fitted_at DESC, id DESC
+            """,
+            (list(fitted),),
+        )
+        latest = {row[0]: tuple(row[1:]) for row in cur.fetchall()}
+        forecast_rows = [(batch_id, main_id, *values) for main_id, values in fitted.items() if latest.get(main_id) != values]
         if forecast_rows:
             execute_values(
                 cur,
-                """
-                INSERT INTO aftershock_forecasts (
-                    batch_id, mainshock_id, aftershock_count, k_value, c_value, p_value,
-                    next_hour_rate, next_six_hour_expected, r_squared, forecast_origin_hours, p_estimated
-                ) VALUES %s
+                f"""
+                INSERT INTO aftershock_forecasts (batch_id, mainshock_id, {", ".join(FORECAST_FIELDS)})
+                VALUES %s
                 ON CONFLICT (batch_id, mainshock_id) DO NOTHING
                 """,
                 forecast_rows,
                 page_size=100,
             )
-            inserted = len(forecast_rows)
-    return inserted
+    return len(fitted), len(forecast_rows)
 
 
 def process_batch(
@@ -541,14 +582,14 @@ def process_batch(
 
     region_count = refresh_active_regions(spark, batch_id, cfg, pg_config)
     t = lap("kmeans", t)
-    forecast_count = compute_aftershock_forecasts(batch_id, cfg, pg_config)
+    forecast_count, forecasts_stored = compute_aftershock_forecasts(batch_id, cfg, pg_config)
     lap("omori", t)
     df.unpersist()
     steps = " ".join(f"{k}={v:.1f}s" for k, v in timings.items())
     print(
         f"Batch {batch_id}: received={len(rows)}, new_events={event_count}, mainshocks={mainshock_count}, "
         f"anomaly_windows={anomaly_count}, bvalue_windows={bvalue_count}, active_regions={region_count}, "
-        f"forecasts={forecast_count} ({time.time() - started:.1f}s: {steps})",
+        f"forecasts={forecast_count} (changed={forecasts_stored}) ({time.time() - started:.1f}s: {steps})",
         flush=True,
     )
 

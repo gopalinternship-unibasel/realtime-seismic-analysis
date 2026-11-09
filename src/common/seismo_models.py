@@ -90,6 +90,84 @@ def omori_expected(k_value: float, c_days: float, p_value: float, from_hours: fl
     return float(k_value * omori_integral(c_days, p_value, from_hours / 24.0, to_hours / 24.0))
 
 
+KM_PER_DEGREE = 111.19
+
+
+def aftershock_search_box(
+    lon: float, lat: float, radius_km: float = AFTERSHOCK_RADIUS_KM
+) -> tuple[float, float, list[tuple[float, float]]]:
+    """A latitude range and one or two longitude ranges that contain every point within ``radius_km``.
+
+    The SQL pre-filter must be a superset of the haversine test in ``aftershock_hours``. A fixed
+    +-4 degree longitude box was too narrow at high latitude (300 km is 5.4 degrees of longitude
+    at 60 N, so Alaskan aftershocks east or west of the mainshock were lost) and broke at the
+    antimeridian (Fiji, Tonga, the Aleutians), where the box must wrap from +180 to -180.
+    """
+    margin = 1.05  # a little wider than needed, so rounding never drops an event on the edge
+    dlat = radius_km / KM_PER_DEGREE * margin
+    lat_min, lat_max = max(-90.0, lat - dlat), min(90.0, lat + dlat)
+    # The widest longitude span of the circle is at the latitude closest to a pole.
+    extreme_lat = max(abs(lat_min), abs(lat_max))
+    cos_lat = math.cos(math.radians(extreme_lat))
+    if extreme_lat >= 89.0 or cos_lat <= 0:
+        return lat_min, lat_max, [(-180.0, 180.0)]
+    dlon = radius_km / (KM_PER_DEGREE * cos_lat) * margin
+    if dlon >= 180.0:
+        return lat_min, lat_max, [(-180.0, 180.0)]
+    lo, hi = lon - dlon, lon + dlon
+    if lo < -180.0:
+        return lat_min, lat_max, [(-180.0, hi), (lo + 360.0, 180.0)]
+    if hi > 180.0:
+        return lat_min, lat_max, [(lo, 180.0), (-180.0, hi - 360.0)]
+    return lat_min, lat_max, [(lo, hi)]
+
+
+def search_box_params(lon: float, lat: float, radius_km: float = AFTERSHOCK_RADIUS_KM) -> tuple[float, ...]:
+    """(lat_min, lat_max, lon_lo_1, lon_hi_1, lon_lo_2, lon_hi_2) for
+    ``latitude BETWEEN ? AND ? AND (longitude BETWEEN ? AND ? OR longitude BETWEEN ? AND ?)``.
+    Without a wrap the second longitude range repeats the first."""
+    lat_min, lat_max, ranges = aftershock_search_box(lon, lat, radius_km)
+    first, second = ranges[0], ranges[-1]
+    return lat_min, lat_max, first[0], first[1], second[0], second[1]
+
+
+def find_larger_events(
+    shocks: Iterable[tuple],
+    radius_km: float = AFTERSHOCK_RADIUS_KM,
+    window_days: float = AFTERSHOCK_WINDOW_DAYS,
+) -> dict[str, Optional[str]]:
+    """Window declustering of the M >= 5 events: event id -> id of a larger event of its sequence, or None.
+
+    ``shocks`` are ``(event_id, source, event_time, magnitude, lon, lat)``. An event has a larger
+    event when another event of the same source with a strictly larger magnitude lies within
+    ``radius_km`` and ``window_days`` of it: before it (the event is that event's aftershock, and
+    the larger event's Omori-Utsu fit already counts it) or after it (the event was a foreshock).
+    These are the same space and time windows the aftershock search uses, so no event is both
+    a mainshock and an aftershock of a larger one. When several larger events qualify, the
+    largest (then the earliest) is returned. Only events mapped to None get a forecast.
+    """
+    by_source: dict[str, list[tuple]] = {}
+    for shock in shocks:
+        by_source.setdefault(shock[1], []).append(shock)
+    window_seconds = window_days * 86400.0
+    result: dict[str, Optional[str]] = {}
+    for events in by_source.values():
+        events.sort(key=lambda s: s[2])
+        for event_id, _source, t, mag, lon, lat in events:
+            best = None
+            for other_id, _s, t2, mag2, lon2, lat2 in events:
+                if other_id == event_id or mag2 is None or mag is None or float(mag2) <= float(mag):
+                    continue
+                if abs((t2 - t).total_seconds()) > window_seconds:
+                    continue
+                if haversine_km(float(lon), float(lat), float(lon2), float(lat2)) > radius_km:
+                    continue
+                if best is None or (float(mag2), -t2.timestamp()) > (float(best[1]), -best[2].timestamp()):
+                    best = (other_id, mag2, t2)
+            result[event_id] = best[0] if best else None
+    return result
+
+
 def aftershock_hours(
     main_time,
     main_lon: float,

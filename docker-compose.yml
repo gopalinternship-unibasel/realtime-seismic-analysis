@@ -278,13 +278,36 @@ services:
       dockerfile: Dockerfile.dashboard
     profiles: ["test"]
     command: python -m pytest -q tests/dashboard
+  # scripts/test.ps1 also starts test-postgres for the forecasting tests (without it they are
+  # skipped, or fail when REQUIRE_TEST_DB=1).
     volumes:
       - ./src:/opt/workspace/src
       - ./tests:/opt/workspace/tests
+    environment:
+      TEST_POSTGRES_HOST: ${TEST_POSTGRES_HOST:-}
+      REQUIRE_TEST_DB: ${REQUIRE_TEST_DB:-0}
+      SCHEMA_SQL: /opt/workspace/sql/init.sql
 
 volumes:
   pgdata:
   kafka-data:
+      - ./sql:/opt/workspace/sql:ro
   spark-checkpoints:
   ivy-cache:
+  # Throwaway database for the forecasting tests: no published port, data in memory only.
+  test-postgres:
+    image: postgres:15-alpine
+    profiles: ["test"]
+    environment:
+      POSTGRES_DB: seismic_test
+      POSTGRES_USER: seismic
+      POSTGRES_PASSWORD: seismic
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U seismic -d seismic_test"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
   producer-state:
