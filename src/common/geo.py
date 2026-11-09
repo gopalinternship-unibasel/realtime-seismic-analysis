@@ -43,7 +43,32 @@ def coarse_region(lon: Optional[float], lat: Optional[float], width: int = 10) -
     return f"R{rg_lon:+04d}_{rg_lat:+03d}"
 
 
-def flatten_usgs_feature(feature: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def haversine_km(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
+    radius = 6371.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    d_phi = math.radians(lat2 - lat1)
+    d_lambda = math.radians(lon2 - lon1)
+    a = math.sin(d_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(d_lambda / 2) ** 2
+    return 2 * radius * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def lonlat_to_unit_vector(lon: float, lat: float) -> tuple[float, float, float]:
+    """Map a lon/lat point to a 3-D unit vector so clustering ignores the dateline seam."""
+    lam, phi = math.radians(lon), math.radians(lat)
+    return math.cos(phi) * math.cos(lam), math.cos(phi) * math.sin(lam), math.sin(phi)
+
+
+def unit_vector_to_lonlat(x: float, y: float, z: float) -> tuple[float, float]:
+    lon = math.degrees(math.atan2(y, x))
+    lat = math.degrees(math.atan2(z, math.sqrt(x * x + y * y)))
+    return lon, lat
+
+
+def is_valid_coordinate(lon: Optional[float], lat: Optional[float]) -> bool:
+    return lon is not None and lat is not None and -180.0 <= lon <= 180.0 and -90.0 <= lat <= 90.0
+
+
+def flatten_usgs_feature(feature: Dict[str, Any], source: str = "usgs-live") -> Optional[Dict[str, Any]]:
     props = feature.get("properties") or {}
     geom = feature.get("geometry") or {}
     coords = geom.get("coordinates") or []
@@ -55,7 +80,7 @@ def flatten_usgs_feature(feature: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     depth = safe_float(coords[2]) if len(coords) > 2 else None
     event_id = feature.get("id") or props.get("code")
     event_time = millis_to_iso(props.get("time"))
-    if not event_id or not event_time or lon is None or lat is None:
+    if not event_id or not event_time or not is_valid_coordinate(lon, lat):
         return None
 
     grid_lon, grid_lat, cell_id = grid_cell(lon, lat)
@@ -81,4 +106,5 @@ def flatten_usgs_feature(feature: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "grid_lat": grid_lat,
         "cell_id": cell_id,
         "region_id": coarse_region(lon, lat),
+        "source": source,
     }
