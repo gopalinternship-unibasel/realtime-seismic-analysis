@@ -184,6 +184,8 @@ class ActiveRegion:
     max_z_score: float
     max_event_count: int
     radius_km: float
+    # False when k reached max_k before every cell was within radius_km of its centroid.
+    within_radius: bool = True
 
 
 def _centroid(vectors: list[tuple[float, float, float]]) -> tuple[float, float]:
@@ -207,10 +209,17 @@ def greedy_region_count(points: list[tuple], radius_km: float) -> int:
     return max(1, len(leaders))
 
 
+# Default cap on k. It only bounds the work: k starts at the number of regions the cells need
+# (greedy_region_count) and stops as soon as every cell is within the radius. The cap used to be 5,
+# so a day with more than 5 separate anomalous areas got 5 "regions" thousands of km wide
+# (QA, 22 hot spots: radii of 3,000 to 4,500 km) with no sign that the radius was not met.
+DEFAULT_MAX_KMEANS_CLUSTERS = 30
+
+
 def cluster_active_cells(
     spark: SparkSession,
     cells: list[dict],
-    max_k: int = 5,
+    max_k: int = DEFAULT_MAX_KMEANS_CLUSTERS,
     radius_km: float = 300.0,
     seed: int = 42,
 ) -> tuple[dict[str, int], list[ActiveRegion]]:
@@ -219,8 +228,11 @@ def cluster_active_cells(
     Cells are clustered on the unit sphere (so the dateline does not split a
     region).  k starts at a greedy estimate of how many regions of ``radius_km``
     cover the cells and grows (up to ``max_k``) until every cell lies within
-    ``radius_km`` of its cluster centroid.  Returns (cell_id -> cluster_id,
-    regions ordered by their strongest z-score).
+    ``radius_km`` of its cluster centroid.  If k reaches ``max_k`` first, the
+    regions of that last fit are returned and every region wider than
+    ``radius_km`` has ``within_radius = False`` (the streaming job logs a warning,
+    stores the flag and the dashboard marks the region).  Returns (cell_id ->
+    cluster_id, regions ordered by their strongest z-score).
     """
     if not cells:
         return {}, []
@@ -264,10 +276,15 @@ def cluster_active_cells(
     def fits(regions: list[ActiveRegion]) -> bool:
         return max(r.radius_km for r in regions) <= radius_km
 
+    def result(regions: list[ActiveRegion]) -> tuple[dict[str, int], list[ActiveRegion]]:
+        for region in regions:
+            region.within_radius = region.radius_km <= radius_km
+        return {cell: region.cluster_id for region in regions for cell in region.cells}, regions
+
     k = min(k_cap, greedy_region_count(points, radius_km))
     best = build({p[0]: 0 for p in points})
     if k == 1 and fits(best) or k_cap == 1:
-        return {cell: 0 for region in best for cell in region.cells}, best
+        return result(best)
 
     feature_schema = StructType([StructField("cell_id", StringType(), False), StructField("features", VectorUDT(), False)])
     feature_df = spark.createDataFrame([(p[0], Vectors.dense(list(p[3]))) for p in points], feature_schema).cache()
@@ -283,4 +300,4 @@ def cluster_active_cells(
         if fits(best):
             break
     feature_df.unpersist()
-    return {cell: region.cluster_id for region in best for cell in region.cells}, best
+    return result(best)

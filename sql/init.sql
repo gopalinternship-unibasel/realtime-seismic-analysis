@@ -103,8 +103,17 @@ CREATE TABLE IF NOT EXISTS active_regions (
     k INTEGER,
     batch_id BIGINT,
     computed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- REGION_RADIUS_KM and MAX_KMEANS_CLUSTERS of the clustering run. within_radius is FALSE for a
+    -- region wider than radius_limit_km: k reached max_k before every cell was within the limit.
+    radius_limit_km DOUBLE PRECISION,
+    max_k INTEGER,
+    within_radius BOOLEAN,
     PRIMARY KEY (source, cluster_id)
 );
+ALTER TABLE active_regions ADD COLUMN IF NOT EXISTS radius_limit_km DOUBLE PRECISION;
+ALTER TABLE active_regions ADD COLUMN IF NOT EXISTS max_k INTEGER;
+ALTER TABLE active_regions ADD COLUMN IF NOT EXISTS within_radius BOOLEAN;
+
 
 CREATE TABLE IF NOT EXISTS mainshocks (
     event_id TEXT PRIMARY KEY REFERENCES seismic_events(event_id) ON DELETE CASCADE,

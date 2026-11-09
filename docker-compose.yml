@@ -163,7 +163,7 @@ services:
       Z_THRESHOLD: ${Z_THRESHOLD:-2.0}
       MIN_EVENTS_FOR_ANOMALY: ${MIN_EVENTS_FOR_ANOMALY:-3}
       BVALUE_MIN_EVENTS: ${BVALUE_MIN_EVENTS:-20}
-      MAX_KMEANS_CLUSTERS: ${MAX_KMEANS_CLUSTERS:-5}
+      MAX_KMEANS_CLUSTERS: ${MAX_KMEANS_CLUSTERS:-30}
       ACTIVE_REGION_HOURS: ${ACTIVE_REGION_HOURS:-24}
       REGION_RADIUS_KM: ${REGION_RADIUS_KM:-300}
       # Cores the streaming job may hold; the rest of the cluster stays free for batch jobs.

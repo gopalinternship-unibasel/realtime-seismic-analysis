@@ -143,7 +143,7 @@ def build_map(events: pd.DataFrame, cells: pd.DataFrame, regions: pd.DataFrame) 
                 text=[f"R{int(c)}" for c in regions["cluster_id"]],
                 hovertext=regions.apply(
                     lambda r: f"Active region R{int(r['cluster_id'])} ({source_label(r['source'])})"
-                    f"<br>{int(r['cell_count'])} cells, radius {r['radius_km']:.0f} km<br>max z={r['max_z_score']:.2f}",
+                    f"<br>{int(r['cell_count'])} cells, radius {radius_text(r)}<br>max z={r['max_z_score']:.2f}",
                     axis=1,
                 ),
                 hoverinfo="text",
@@ -350,6 +350,41 @@ def metric_card(label: str, value, card_id: str) -> html.Div:
     )
 
 
+def is_wide_region(region) -> bool:
+    """A region the streaming job flagged as wider than REGION_RADIUS_KM (k reached MAX_KMEANS_CLUSTERS).
+
+    Rows written before the flag existed have NULL there and are not marked.
+    """
+    flag = region.get("within_radius")
+    return flag is not None and not pd.isna(flag) and not bool(flag)
+
+
+def radius_text(region) -> str:
+    shown = f"{region['radius_km']:,.0f} km"
+    if is_wide_region(region):
+        limit = region.get("radius_limit_km")
+        shown += f" (over the {limit:,.0f} km limit)" if limit is not None and pd.notna(limit) else " (over the limit)"
+    return shown
+
+
+def wide_regions_note(regions: pd.DataFrame) -> html.Div | None:
+    wide = [r for _, r in regions.iterrows() if is_wide_region(r)]
+    if not wide:
+        return None
+    limits = {float(r["radius_limit_km"]) for r in wide if pd.notna(r.get("radius_limit_km"))}
+    caps = {int(r["max_k"]) for r in wide if pd.notna(r.get("max_k"))}
+    limit_text = f"{min(limits):,.0f} km" if limits else "the radius limit"
+    cap_text = f"MAX_KMEANS_CLUSTERS = {min(caps)}" if caps else "MAX_KMEANS_CLUSTERS"
+    sources = sorted({source_label(r["source"]) for r in wide})
+    return html.Div(
+        f"{len(wide)} region(s) of {', '.join(sources)} are wider than {limit_text}: the anomalous cells lie in more "
+        f"separate areas than {cap_text} regions can cover, so cells far apart share a region. "
+        "Raise MAX_KMEANS_CLUSTERS in .env and run start.ps1 again to split them.",
+        id="regions-warning",
+        className="regions-warning",
+    )
+
+
 def regions_table(regions: pd.DataFrame) -> html.Div:
     if regions.empty:
         return html.Div("No active regions: no grid cell is anomalous in the last 24 hours of data.",
@@ -362,7 +397,7 @@ def regions_table(regions: pd.DataFrame) -> html.Div:
                 html.Td(source_label(r["source"])),
                 html.Td(f"{r['centroid_lon']:.2f}, {r['centroid_lat']:.2f}"),
                 html.Td(int(r["cell_count"])),
-                html.Td(f"{r['radius_km']:.0f} km"),
+                html.Td(radius_text(r), className="radius-over" if is_wide_region(r) else None),
                 html.Td(f"{r['max_z_score']:.1f}"),
                 html.Td(int(r["max_event_count"])),
                 html.Td(r["cells"], style={"fontFamily": "monospace", "fontSize": "12px"}),
@@ -370,12 +405,14 @@ def regions_table(regions: pd.DataFrame) -> html.Div:
         )
         for _, r in regions.iterrows()
     ]
-    return html.Table(
+    table = html.Table(
         [html.Thead(html.Tr([html.Th(h, style={"textAlign": "left", "paddingRight": "16px"}) for h in header]))]
         + [html.Tbody(rows)],
         id="regions-table-content",
         style={"width": "100%", "borderCollapse": "collapse"},
     )
+    note = wide_regions_note(regions)
+    return html.Div([note, table]) if note is not None else table
 
 
 # --------------------------------------------------------------------------- data access

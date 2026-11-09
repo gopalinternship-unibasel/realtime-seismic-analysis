@@ -294,3 +294,30 @@ def test_layout_uses_the_responsive_stylesheet():
     assert found["forecast-summary"] == "forecast-summary"
     # No fixed-width grid is left in inline styles (they caused the 519 px overflow on a phone).
     assert "gridTemplateColumns" not in str(dash_app.app.layout)
+
+
+def test_regions_wider_than_the_radius_are_marked():
+    regions = pd.DataFrame(
+        {
+            "source": ["usgs-live", "usgs-live"],
+            "cluster_id": [0, 1],
+            "centroid_lon": [-122.5, 20.0],
+            "centroid_lat": [37.5, 10.0],
+            "cell_count": [1, 6],
+            "radius_km": [0.0, 3129.4],
+            "max_z_score": [17.6, 3.5],
+            "max_event_count": [9, 4],
+            "cells": ["-123:37", "-5:10 -80:-20"],
+            "radius_limit_km": [300.0, 300.0],
+            "max_k": [5, 5],
+            "within_radius": [True, False],
+        }
+    )
+    shown = text_of(dash_app.regions_table(regions))
+    assert "3,129 km (over the 300 km limit)" in shown and "0 km (over" not in shown
+    assert "1 region(s) of Live USGS feed are wider than 300 km" in shown and "MAX_KMEANS_CLUSTERS = 5" in shown
+    hover = dash_app.build_map(pd.DataFrame(), pd.DataFrame(), regions).data[0].hovertext
+    assert "over the 300 km limit" in hover[1] and "over" not in hover[0]
+    # Rows from before the flag existed (no columns, or NULL) are not marked.
+    old = regions.drop(columns=["radius_limit_km", "max_k", "within_radius"])
+    assert "over the" not in text_of(dash_app.regions_table(old))

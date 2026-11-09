@@ -350,13 +350,22 @@ def refresh_active_regions(spark: SparkSession, batch_id: int, cfg: StreamConfig
                     spark, cells, max_k=cfg.max_kmeans_clusters, radius_km=cfg.region_radius_km
                 )
                 centroids = {r.cluster_id: (r.centroid_lon, r.centroid_lat) for r in regions}
+                wide = [r for r in regions if not r.within_radius]
+                if wide:
+                    print(
+                        f"WARNING batch {batch_id}: {len(wide)} of {len(regions)} active regions of source {source} are "
+                        f"wider than REGION_RADIUS_KM={cfg.region_radius_km:g} km (up to {max(r.radius_km for r in wide):,.0f} km): "
+                        f"its {len(cells)} anomalous cells need more than MAX_KMEANS_CLUSTERS={cfg.max_kmeans_clusters} regions",
+                        flush=True,
+                    )
                 cur.execute("DELETE FROM active_regions WHERE source = %s", (source,))
                 execute_values(
                     cur,
                     """
                     INSERT INTO active_regions (
                         source, cluster_id, centroid_lon, centroid_lat, cell_count, cells,
-                        max_z_score, max_event_count, radius_km, k, batch_id
+                        max_z_score, max_event_count, radius_km, k, batch_id,
+                        radius_limit_km, max_k, within_radius
                     ) VALUES %s
                     """,
                     [
@@ -372,6 +381,9 @@ def refresh_active_regions(spark: SparkSession, batch_id: int, cfg: StreamConfig
                             r.radius_km,
                             len(regions),
                             batch_id,
+                            float(cfg.region_radius_km),
+                            int(cfg.max_kmeans_clusters),
+                            bool(r.within_radius),
                         )
                         for r in regions
                     ],

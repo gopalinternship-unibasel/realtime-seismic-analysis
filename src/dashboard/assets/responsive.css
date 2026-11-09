@@ -90,3 +90,17 @@
     padding: 12px;
   }
 }
+
+/* Active regions wider than REGION_RADIUS_KM (k reached MAX_KMEANS_CLUSTERS). */
+.regions-warning {
+  color: #b45309;
+  font-size: 14px;
+  line-height: 1.45;
+  margin-bottom: 8px;
+  overflow-wrap: anywhere;
+}
+
+.radius-over {
+  color: #b45309;
+  font-weight: 600;
+}

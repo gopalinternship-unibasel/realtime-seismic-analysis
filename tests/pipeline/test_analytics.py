@@ -139,10 +139,24 @@ def test_kmeans_handles_the_dateline(spark):
     assert abs(abs(regions[0].centroid_lon) - 180) < 1.0
 
 
-def test_kmeans_respects_max_k(spark):
+def test_kmeans_respects_max_k_and_flags_the_regions_it_could_not_fit(spark):
     cells = [cell(f"{lon}:0") for lon in (-150, -90, -30, 30, 90, 150)]
     _assignment, regions = cluster_active_cells(spark, cells, max_k=3, radius_km=300)
     assert len(regions) == 3
+    # Three regions cannot hold six spots 60 degrees apart within 300 km: every region says so.
+    assert all(r.radius_km > 300 and r.within_radius is False for r in regions)
+
+
+def test_more_than_five_separate_hot_spots_each_get_a_region_within_the_radius(spark):
+    # QA round 2: 22 M5 sequences 15 degrees of longitude apart. With k capped at 5 they were merged
+    # into 5 "regions" with radii of 3,000 to 4,500 km and no warning.
+    cells = [cell(f"{-170 + 15 * i}:{10 if i % 2 else -20}", z=3.5, count=4) for i in range(22)]
+    assignment, regions = cluster_active_cells(spark, cells, radius_km=300)
+    assert len(regions) == 22 and len(set(assignment.values())) == 22
+    assert all(r.within_radius and r.radius_km <= 300 for r in regions)
+    # A single region of nearby cells is still within the radius, also with the cap.
+    _a, near = cluster_active_cells(spark, [cell("-123:37"), cell("-124:38")], max_k=1, radius_km=300)
+    assert len(near) == 1 and near[0].within_radius
 
 
 def test_bvalue_mc_is_never_below_the_regional_long_term_mc(spark):
