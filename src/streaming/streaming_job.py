@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-import math
 import os
-from datetime import datetime, timezone
-from typing import Iterable
+import time
+from contextlib import closing
+from datetime import timedelta
+from pathlib import Path
 
 import psycopg2
 from psycopg2.extras import execute_values
-from pyspark.ml.clustering import KMeans
-from pyspark.ml.feature import VectorAssembler
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import (
@@ -17,11 +16,25 @@ from pyspark.sql.types import (
     StringType,
     StructField,
     StructType,
-    TimestampType,
 )
 
 from src.common.config import KafkaConfig, PostgresConfig, StreamConfig
-from src.common.seismo_models import estimate_b_value, estimate_completeness_magnitude, fit_omori_utsu
+from src.common.seismo_models import (
+    AFTERSHOCK_RADIUS_KM,
+    AFTERSHOCK_WINDOW_DAYS,
+    aftershock_hours,
+    fit_omori_utsu,
+)
+from src.streaming.analytics import (
+    MAX_WINDOW_HOURS,
+    anomaly_windows,
+    bvalue_rows,
+    bvalue_window_magnitudes,
+    cell_id_expr,
+    cluster_active_cells,
+    is_earthquake,
+    region_id_expr,
+)
 
 EVENT_SCHEMA = StructType(
     [
@@ -46,6 +59,7 @@ EVENT_SCHEMA = StructType(
         StructField("grid_lat", IntegerType(), True),
         StructField("cell_id", StringType(), True),
         StructField("region_id", StringType(), True),
+        StructField("source", StringType(), True),
     ]
 )
 
@@ -71,143 +85,132 @@ EVENT_COLUMNS = [
     "grid_lat",
     "cell_id",
     "region_id",
+    "source",
 ]
+
+SCHEMA_SQL = Path(os.getenv("SCHEMA_SQL", "/opt/workspace/sql/init.sql"))
 
 
 def pg_connect(config: PostgresConfig):
     return psycopg2.connect(config.dsn)
 
 
-def rows_or_empty(df: DataFrame, columns: list[str]) -> list[tuple]:
-    return [tuple(row[c] for c in columns) for row in df.select(*columns).collect()]
+def ensure_schema(pg_config: PostgresConfig, wait_seconds: int = 90) -> None:
+    """Apply sql/init.sql (idempotent) so older volumes get the new columns and keys."""
+    if not SCHEMA_SQL.exists():
+        print(f"Schema file {SCHEMA_SQL} not found; assuming the database is initialised", flush=True)
+        return
+    deadline = time.time() + wait_seconds
+    while True:
+        try:
+            with closing(pg_connect(pg_config)) as conn, conn, conn.cursor() as cur:
+                cur.execute(SCHEMA_SQL.read_text(encoding="utf-8"))
+            return
+        except psycopg2.OperationalError as exc:
+            if time.time() > deadline:
+                raise
+            print(f"PostgreSQL not ready yet ({exc.__class__.__name__}); retrying...", flush=True)
+            time.sleep(3)
 
 
-def write_events_to_postgres(df: DataFrame, pg_config: PostgresConfig) -> int:
-    rows = rows_or_empty(df, EVENT_COLUMNS)
+def is_earthquake_type(event_type: str | None) -> bool:
+    return (event_type or "earthquake").lower() == "earthquake"
+
+
+def write_event_rows(rows: list, pg_config: PostgresConfig) -> int:
+    """Insert new events; returns how many were not already stored (idempotent on event_id)."""
     if not rows:
         return 0
     sql = """
         INSERT INTO seismic_events (
             event_id, event_time, ingestion_time, magnitude, depth_km, longitude, latitude,
             place, event_type, status, tsunami, significance, station_count, rms,
-            azimuthal_gap, felt_count, url, grid_lon, grid_lat, cell_id, region_id
+            azimuthal_gap, felt_count, url, grid_lon, grid_lat, cell_id, region_id, source
         ) VALUES %s
         ON CONFLICT (event_id) DO NOTHING
+        RETURNING event_id
     """
-    with pg_connect(pg_config) as conn:
-        with conn.cursor() as cur:
-            execute_values(cur, sql, rows, page_size=1000)
-    return len(rows)
+    values = [tuple(row[c] for c in EVENT_COLUMNS) for row in rows]
+    with closing(pg_connect(pg_config)) as conn, conn, conn.cursor() as cur:
+        inserted = execute_values(cur, sql, values, page_size=1000, fetch=True)
+    return len(inserted)
 
 
-def write_mainshocks(df: DataFrame, pg_config: PostgresConfig) -> int:
-    mainshock_rows = rows_or_empty(
-        df.filter(F.col("magnitude") >= F.lit(5.0)),
-        ["event_id", "event_ts", "magnitude", "longitude", "latitude", "place"],
-    )
+def write_mainshock_rows(rows: list, pg_config: PostgresConfig, min_magnitude: float) -> int:
+    mainshock_rows = [
+        (r["event_id"], r["event_ts"], r["magnitude"], r["longitude"], r["latitude"], r["place"], r["source"])
+        for r in rows
+        if r["magnitude"] is not None and r["magnitude"] >= min_magnitude and is_earthquake_type(r["event_type"])
+    ]
     if not mainshock_rows:
         return 0
     sql = """
-        INSERT INTO mainshocks (event_id, event_time, magnitude, longitude, latitude, place)
+        INSERT INTO mainshocks (event_id, event_time, magnitude, longitude, latitude, place, source)
         VALUES %s
         ON CONFLICT (event_id) DO NOTHING
     """
-    with pg_connect(pg_config) as conn:
-        with conn.cursor() as cur:
-            execute_values(cur, sql, mainshock_rows, page_size=500)
+    with closing(pg_connect(pg_config)) as conn, conn, conn.cursor() as cur:
+        execute_values(cur, sql, mainshock_rows, page_size=500)
     return len(mainshock_rows)
 
 
-def compute_anomalies(df: DataFrame, baseline_df: DataFrame, batch_id: int, cfg: StreamConfig, pg_config: PostgresConfig) -> int:
-    agg = (
-        df.filter(F.col("event_ts").isNotNull() & F.col("cell_id").isNotNull())
-        .groupBy(F.window("event_ts", "6 hours", "1 hour"), "cell_id", "grid_lon", "grid_lat")
-        .agg(F.count("*").alias("event_count"))
+def load_stored_events(spark: SparkSession, pg_config: PostgresConfig, lo, hi) -> DataFrame:
+    """Read the stored earthquakes in [lo, hi) back from PostgreSQL with Spark's JDBC source."""
+    query = (
+        "SELECT event_id, event_time AS event_ts, magnitude, cell_id, grid_lon, grid_lat, region_id, source "
+        "FROM seismic_events "
+        f"WHERE event_time >= TIMESTAMPTZ '{lo.isoformat()}' AND event_time < TIMESTAMPTZ '{hi.isoformat()}' "
+        "AND COALESCE(LOWER(event_type), 'earthquake') = 'earthquake'"
+    )
+    return (
+        spark.read.format("jdbc")
+        .option("url", pg_config.jdbc_url)
+        .option("driver", "org.postgresql.Driver")
+        .option("user", pg_config.user)
+        .option("password", pg_config.password)
+        .option("query", query)
+        .load()
     )
 
-    scored = (
-        agg.join(baseline_df, on="cell_id", how="left")
-        .withColumn("baseline_mean", F.coalesce(F.col("baseline_mean"), F.lit(0.5)))
-        .withColumn("baseline_std", F.coalesce(F.col("baseline_std"), F.lit(1.0)))
-        .withColumn("safe_std", F.when(F.col("baseline_std") < 0.1, F.lit(0.1)).otherwise(F.col("baseline_std")))
-        .withColumn("z_score", (F.col("event_count") - F.col("baseline_mean")) / F.col("safe_std"))
-        .filter((F.col("event_count") >= cfg.min_events_for_anomaly) & (F.col("z_score") >= cfg.z_threshold))
-        .withColumn("center_lon", F.col("grid_lon") + F.lit(0.5))
-        .withColumn("center_lat", F.col("grid_lat") + F.lit(0.5))
-    )
 
-    flagged_count = scored.count()
-    if flagged_count == 0:
+def upsert_anomalies(
+    recent: DataFrame, quakes: DataFrame, baseline_df: DataFrame, batch_id: int, cfg: StreamConfig, pg_config: PostgresConfig
+) -> int:
+    scored = anomaly_windows(recent, quakes, baseline_df, cfg.z_threshold, cfg.min_events_for_anomaly)
+    rows = [
+        (
+            batch_id,
+            r["source"],
+            r["window_start"],
+            r["window_end"],
+            r["cell_id"],
+            r["grid_lon"],
+            r["grid_lat"],
+            int(r["event_count"]),
+            float(r["baseline_mean"]),
+            float(r["baseline_std"]),
+            float(r["z_score"]),
+        )
+        for r in scored.collect()
+    ]
+    if not rows:
         return 0
-
-    if flagged_count >= 2:
-        k = min(cfg.max_kmeans_clusters, int(flagged_count))
-        assembler = VectorAssembler(inputCols=["center_lon", "center_lat"], outputCol="features")
-        feature_df = assembler.transform(scored)
-        model = KMeans(k=k, seed=42, featuresCol="features", predictionCol="cluster_id").fit(feature_df)
-        clustered = model.transform(feature_df)
-        centers = {idx: (float(c[0]), float(c[1])) for idx, c in enumerate(model.clusterCenters())}
-        anomaly_rows = []
-        for row in clustered.select(
-            "window",
-            "cell_id",
-            "grid_lon",
-            "grid_lat",
-            "event_count",
-            "baseline_mean",
-            "baseline_std",
-            "z_score",
-            "cluster_id",
-        ).collect():
-            centroid_lon, centroid_lat = centers.get(int(row["cluster_id"]), (None, None))
-            anomaly_rows.append(
-                (
-                    batch_id,
-                    row["window"].start,
-                    row["window"].end,
-                    row["cell_id"],
-                    row["grid_lon"],
-                    row["grid_lat"],
-                    int(row["event_count"]),
-                    float(row["baseline_mean"]),
-                    float(row["baseline_std"]),
-                    float(row["z_score"]),
-                    int(row["cluster_id"]),
-                    centroid_lon,
-                    centroid_lat,
-                )
-            )
-    else:
-        row = scored.collect()[0]
-        anomaly_rows = [
-            (
-                batch_id,
-                row["window"].start,
-                row["window"].end,
-                row["cell_id"],
-                row["grid_lon"],
-                row["grid_lat"],
-                int(row["event_count"]),
-                float(row["baseline_mean"]),
-                float(row["baseline_std"]),
-                float(row["z_score"]),
-                0,
-                float(row["center_lon"]),
-                float(row["center_lat"]),
-            )
-        ]
-
     sql = """
         INSERT INTO anomaly_windows (
-            batch_id, window_start, window_end, cell_id, grid_lon, grid_lat, event_count,
-            baseline_mean, baseline_std, z_score, cluster_id, centroid_lon, centroid_lat
+            batch_id, source, window_start, window_end, cell_id, grid_lon, grid_lat, event_count,
+            baseline_mean, baseline_std, z_score
         ) VALUES %s
-        ON CONFLICT (batch_id, window_start, window_end, cell_id) DO NOTHING
+        ON CONFLICT (source, window_start, window_end, cell_id) DO UPDATE SET
+            batch_id = EXCLUDED.batch_id,
+            event_count = EXCLUDED.event_count,
+            baseline_mean = EXCLUDED.baseline_mean,
+            baseline_std = EXCLUDED.baseline_std,
+            z_score = EXCLUDED.z_score,
+            updated_at = now()
     """
-    with pg_connect(pg_config) as conn:
-        with conn.cursor() as cur:
-            execute_values(cur, sql, anomaly_rows, page_size=500)
-    return len(anomaly_rows)
+    with closing(pg_connect(pg_config)) as conn, conn, conn.cursor() as cur:
+        execute_values(cur, sql, rows, page_size=500)
+    return len(rows)
 
 
 def load_long_term_bvalues(path: str) -> dict[str, float]:
@@ -232,161 +235,291 @@ def load_long_term_bvalues(path: str) -> dict[str, float]:
     return result
 
 
-def compute_bvalues(df: DataFrame, batch_id: int, pg_config: PostgresConfig) -> int:
-    region_b_path = os.getenv("REGION_BVALUE_CSV", "/opt/workspace/data/baseline/region_bvalues.csv")
-    long_term = load_long_term_bvalues(region_b_path)
-    grouped = (
-        df.filter(F.col("magnitude").isNotNull() & F.col("event_ts").isNotNull() & F.col("region_id").isNotNull())
-        .groupBy(F.window("event_ts", "24 hours", "1 hour"), "region_id")
-        .agg(F.collect_list("magnitude").alias("magnitudes"), F.count("*").alias("event_count"))
-    )
-
-    rows = []
-    for row in grouped.collect():
-        magnitudes = [float(m) for m in row["magnitudes"] if m is not None]
-        if len(magnitudes) < 5:
-            continue
-        mc = estimate_completeness_magnitude(magnitudes)
-        if mc is None:
-            continue
-        b_value, b_sigma, n_above = estimate_b_value(magnitudes, mc)
-        if b_value is None or b_sigma is None:
-            continue
-        long_b = long_term.get(row["region_id"], 1.0)
-        deviation = b_value - long_b
-        is_alert = bool(abs(deviation) > max(0.25, 2.0 * b_sigma) and n_above >= 5)
-        rows.append(
-            (
-                batch_id,
-                row["window"].start,
-                row["window"].end,
-                row["region_id"],
-                int(n_above),
-                float(mc),
-                float(b_value),
-                float(b_sigma),
-                float(long_b),
-                float(deviation),
-                is_alert,
-            )
-        )
-
+def upsert_bvalues(
+    recent: DataFrame,
+    quakes: DataFrame,
+    long_term: dict[str, float],
+    batch_id: int,
+    cfg: StreamConfig,
+    pg_config: PostgresConfig,
+) -> int:
+    rows = bvalue_rows(bvalue_window_magnitudes(recent, quakes).collect(), long_term, batch_id, cfg.bvalue_min_events)
     if not rows:
         return 0
     sql = """
         INSERT INTO bvalue_windows (
-            batch_id, window_start, window_end, region_id, event_count, completeness_mag,
+            batch_id, source, window_start, window_end, region_id, event_count, completeness_mag,
             b_value, b_sigma, long_term_b, deviation, is_alert
         ) VALUES %s
-        ON CONFLICT (batch_id, window_start, window_end, region_id) DO NOTHING
+        ON CONFLICT (source, window_start, window_end, region_id) DO UPDATE SET
+            batch_id = EXCLUDED.batch_id,
+            event_count = EXCLUDED.event_count,
+            completeness_mag = EXCLUDED.completeness_mag,
+            b_value = EXCLUDED.b_value,
+            b_sigma = EXCLUDED.b_sigma,
+            long_term_b = EXCLUDED.long_term_b,
+            deviation = EXCLUDED.deviation,
+            is_alert = EXCLUDED.is_alert,
+            updated_at = now()
     """
-    with pg_connect(pg_config) as conn:
-        with conn.cursor() as cur:
-            execute_values(cur, sql, rows, page_size=500)
+    with closing(pg_connect(pg_config)) as conn, conn, conn.cursor() as cur:
+        execute_values(cur, sql, rows, page_size=500)
     return len(rows)
 
 
-def haversine_km(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
-    radius = 6371.0
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    d_phi = math.radians(lat2 - lat1)
-    d_lambda = math.radians(lon2 - lon1)
-    a = math.sin(d_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(d_lambda / 2) ** 2
-    return 2 * radius * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+# Per source: (anomalous-cell signature, cell -> region id, region id -> centroid) of the last clustering.
+_LAST_CLUSTERING: dict[str, tuple] = {}
 
 
-def compute_aftershock_forecasts(batch_id: int, pg_config: PostgresConfig) -> int:
-    inserted = 0
-    with pg_connect(pg_config) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE mainshocks
-                SET active = FALSE
-                WHERE active = TRUE AND event_time < now() - interval '30 days'
-                """
+def refresh_active_regions(spark: SparkSession, batch_id: int, cfg: StreamConfig, pg_config: PostgresConfig) -> int:
+    """Cluster the cells flagged in the last ``active_region_hours`` (per source) into active regions.
+
+    K-Means only reruns when the set of anomalous cells (or their scores) changed since the last
+    micro-batch; otherwise the stored regions are still current and only new windows get labelled.
+    """
+    with closing(pg_connect(pg_config)) as conn, conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            WITH clocks AS (
+                SELECT source, MAX(event_time) AS clock FROM seismic_events GROUP BY source
             )
-            cur.execute(
-                """
-                SELECT event_id, event_time, magnitude, longitude, latitude, place
-                FROM mainshocks
-                WHERE active = TRUE
-                ORDER BY event_time DESC
-                LIMIT 20
-                """
+            SELECT a.source, a.cell_id, a.grid_lon, a.grid_lat, MAX(a.z_score), MAX(a.event_count)
+            FROM anomaly_windows a JOIN clocks c ON c.source = a.source
+            WHERE a.window_end > c.clock - make_interval(hours => %s)
+            GROUP BY a.source, a.cell_id, a.grid_lon, a.grid_lat
+            """,
+            (cfg.active_region_hours,),
+        )
+        by_source: dict[str, list[dict]] = {}
+        for source, cell_id, grid_lon, grid_lat, max_z, max_count in cur.fetchall():
+            by_source.setdefault(source, []).append(
+                {
+                    "cell_id": cell_id,
+                    "center_lon": float(grid_lon) + 0.5,
+                    "center_lat": float(grid_lat) + 0.5,
+                    "max_z_score": float(max_z),
+                    "max_event_count": int(max_count),
+                }
             )
-            mainshocks = cur.fetchall()
+        cur.execute("SELECT DISTINCT source FROM active_regions")
+        stale_sources = {r[0] for r in cur.fetchall()} - set(by_source)
 
-            forecast_rows = []
-            for main_id, main_time, main_mag, main_lon, main_lat, _place in mainshocks:
-                cur.execute(
-                    """
-                    SELECT event_time, magnitude, longitude, latitude
-                    FROM seismic_events
-                    WHERE event_time > %s
-                      AND event_time <= %s + interval '7 days'
-                      AND magnitude < %s
-                      AND longitude BETWEEN %s AND %s
-                      AND latitude BETWEEN %s AND %s
-                    ORDER BY event_time ASC
-                    """,
-                    (main_time, main_time, main_mag, main_lon - 4.0, main_lon + 4.0, main_lat - 4.0, main_lat + 4.0),
+    total = 0
+    with closing(pg_connect(pg_config)) as conn, conn, conn.cursor() as cur:
+        for source in stale_sources:
+            cur.execute("DELETE FROM active_regions WHERE source = %s", (source,))
+            _LAST_CLUSTERING.pop(source, None)
+        for source, cells in by_source.items():
+            signature = tuple(sorted((c["cell_id"], round(c["max_z_score"], 3), c["max_event_count"]) for c in cells))
+            cached = _LAST_CLUSTERING.get(source)
+            if cached is not None and cached[0] == signature:
+                _signature, assignment, centroids = cached
+            else:
+                assignment, regions = cluster_active_cells(
+                    spark, cells, max_k=cfg.max_kmeans_clusters, radius_km=cfg.region_radius_km
                 )
-                hours_after = []
-                for event_time, _mag, lon, lat in cur.fetchall():
-                    if haversine_km(float(main_lon), float(main_lat), float(lon), float(lat)) <= 300.0:
-                        hours = (event_time - main_time).total_seconds() / 3600.0
-                        if hours > 0:
-                            hours_after.append(hours)
-                fit = fit_omori_utsu(hours_after)
-                if fit is None:
-                    continue
-                forecast_rows.append(
-                    (
-                        batch_id,
-                        main_id,
-                        fit.aftershock_count,
-                        fit.k_value,
-                        fit.c_value,
-                        fit.p_value,
-                        fit.next_hour_rate,
-                        fit.next_six_hour_expected,
-                        fit.r_squared,
-                    )
-                )
-
-            if forecast_rows:
+                centroids = {r.cluster_id: (r.centroid_lon, r.centroid_lat) for r in regions}
+                cur.execute("DELETE FROM active_regions WHERE source = %s", (source,))
                 execute_values(
                     cur,
                     """
-                    INSERT INTO aftershock_forecasts (
-                        batch_id, mainshock_id, aftershock_count, k_value, c_value, p_value,
-                        next_hour_rate, next_six_hour_expected, r_squared
+                    INSERT INTO active_regions (
+                        source, cluster_id, centroid_lon, centroid_lat, cell_count, cells,
+                        max_z_score, max_event_count, radius_km, k, batch_id
                     ) VALUES %s
-                    ON CONFLICT (batch_id, mainshock_id) DO NOTHING
                     """,
-                    forecast_rows,
-                    page_size=100,
+                    [
+                        (
+                            source,
+                            r.cluster_id,
+                            r.centroid_lon,
+                            r.centroid_lat,
+                            len(r.cells),
+                            " ".join(r.cells),
+                            r.max_z_score,
+                            r.max_event_count,
+                            r.radius_km,
+                            len(regions),
+                            batch_id,
+                        )
+                        for r in regions
+                    ],
                 )
-                inserted = len(forecast_rows)
+                _LAST_CLUSTERING[source] = (signature, assignment, centroids)
+            execute_values(
+                cur,
+                f"""
+                UPDATE anomaly_windows AS a
+                SET cluster_id = v.cluster_id, centroid_lon = v.lon, centroid_lat = v.lat
+                FROM (VALUES %s) AS v(source, cell_id, cluster_id, lon, lat)
+                WHERE a.source = v.source AND a.cell_id = v.cell_id
+                  AND a.cluster_id IS DISTINCT FROM v.cluster_id
+                  AND a.window_end > (SELECT MAX(event_time) FROM seismic_events s WHERE s.source = v.source)
+                                     - make_interval(hours => {int(cfg.active_region_hours)})
+                """,
+                [
+                    (source, cell, cluster, centroids[cluster][0], centroids[cluster][1])
+                    for cell, cluster in assignment.items()
+                ],
+            )
+            total += len(centroids)
+    return total
+
+
+def compute_aftershock_forecasts(batch_id: int, cfg: StreamConfig, pg_config: PostgresConfig) -> int:
+    """Fit Omori-Utsu to the aftershocks of every active mainshock and store the forecast.
+
+    "Now" is each source's data clock (its latest event time), so a replayed
+    catalogue is forecast on its own timeline just like the live feed.
+    """
+    inserted = 0
+    with closing(pg_connect(pg_config)) as conn, conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE mainshocks m
+            SET active = FALSE
+            WHERE active = TRUE
+              AND event_time < (SELECT MAX(event_time) FROM seismic_events s WHERE s.source = m.source)
+                               - make_interval(days => %s)
+            """,
+            (cfg.mainshock_active_days,),
+        )
+        cur.execute(
+            """
+            SELECT m.event_id, m.event_time, m.magnitude, m.longitude, m.latitude, m.source,
+                   (SELECT MAX(event_time) FROM seismic_events s WHERE s.source = m.source) AS clock
+            FROM mainshocks m
+            WHERE m.active = TRUE
+            ORDER BY m.event_time DESC
+            LIMIT 20
+            """
+        )
+        mainshocks = cur.fetchall()
+
+        forecast_rows = []
+        for main_id, main_time, main_mag, main_lon, main_lat, source, clock in mainshocks:
+            cur.execute(
+                """
+                SELECT event_time, longitude, latitude
+                FROM seismic_events
+                WHERE source = %s
+                  AND event_time > %s
+                  AND event_time <= %s + make_interval(days => %s)
+                  AND magnitude < %s
+                  AND COALESCE(LOWER(event_type), 'earthquake') = 'earthquake'
+                  AND longitude BETWEEN %s AND %s
+                  AND latitude BETWEEN %s AND %s
+                ORDER BY event_time ASC
+                """,
+                (
+                    source,
+                    main_time,
+                    main_time,
+                    AFTERSHOCK_WINDOW_DAYS,
+                    main_mag,
+                    main_lon - 4.0,
+                    main_lon + 4.0,
+                    main_lat - 4.0,
+                    main_lat + 4.0,
+                ),
+            )
+            hours_after = aftershock_hours(main_time, main_lon, main_lat, cur.fetchall(), AFTERSHOCK_RADIUS_KM)
+            elapsed_hours = (clock - main_time).total_seconds() / 3600.0 if clock is not None else None
+            # Aftershocks are only collected for AFTERSHOCK_WINDOW_DAYS, so that is the longest observed span.
+            observed_hours = None if elapsed_hours is None else min(elapsed_hours, AFTERSHOCK_WINDOW_DAYS * 24.0)
+            fit = fit_omori_utsu(hours_after, forecast_from_hours=elapsed_hours, observed_until_hours=observed_hours)
+            if fit is None:
+                continue
+            forecast_rows.append(
+                (
+                    batch_id,
+                    main_id,
+                    fit.aftershock_count,
+                    fit.k_value,
+                    fit.c_value,
+                    fit.p_value,
+                    fit.next_hour_rate,
+                    fit.next_six_hour_expected,
+                    fit.r_squared,
+                    fit.forecast_origin_hours,
+                    fit.p_estimated,
+                )
+            )
+
+        if forecast_rows:
+            execute_values(
+                cur,
+                """
+                INSERT INTO aftershock_forecasts (
+                    batch_id, mainshock_id, aftershock_count, k_value, c_value, p_value,
+                    next_hour_rate, next_six_hour_expected, r_squared, forecast_origin_hours, p_estimated
+                ) VALUES %s
+                ON CONFLICT (batch_id, mainshock_id) DO NOTHING
+                """,
+                forecast_rows,
+                page_size=100,
+            )
+            inserted = len(forecast_rows)
     return inserted
 
 
-def process_batch(batch_df: DataFrame, batch_id: int, baseline_df: DataFrame, cfg: StreamConfig, pg_config: PostgresConfig) -> None:
-    if batch_df.rdd.isEmpty():
-        print(f"Batch {batch_id}: empty")
-        return
+def process_batch(
+    batch_df: DataFrame,
+    batch_id: int,
+    spark: SparkSession,
+    baseline_df: DataFrame,
+    long_term_b: dict[str, float],
+    cfg: StreamConfig,
+    pg_config: PostgresConfig,
+) -> None:
+    started = time.time()
+    timings: dict[str, float] = {}
 
-    df = batch_df.dropDuplicates(["event_id"]).cache()
-    event_count = write_events_to_postgres(df, pg_config)
-    mainshock_count = write_mainshocks(df, pg_config)
-    anomaly_count = compute_anomalies(df, baseline_df, batch_id, cfg, pg_config)
-    bvalue_count = compute_bvalues(df, batch_id, pg_config)
-    forecast_count = compute_aftershock_forecasts(batch_id, pg_config)
+    def lap(name: str, t0: float) -> float:
+        now = time.time()
+        timings[name] = now - t0
+        return now
+
+    # Materialise the micro-batch once; every later step reads the cached rows.
+    df = batch_df.dropDuplicates(["event_id"]).persist()
+    rows = df.select(*EVENT_COLUMNS).collect()
+    if not rows:
+        df.unpersist()
+        print(f"Batch {batch_id}: empty", flush=True)
+        return
+    t = lap("read", started)
+
+    event_count = write_event_rows(rows, pg_config)
+    mainshock_count = write_mainshock_rows(rows, pg_config, cfg.mainshock_magnitude)
+    t = lap("store", t)
+
+    anomaly_count = bvalue_count = 0
+    quake_times = [r["event_ts"] for r in rows if is_earthquake_type(r["event_type"])]
+    if quake_times:
+        lo, hi = min(quake_times), max(quake_times)
+        quakes = df.filter(is_earthquake(F.col("event_type"))).select(
+            "event_id", "event_ts", "magnitude", "cell_id", "grid_lon", "grid_lat", "region_id", "source"
+        )
+        # Every stored event that can share a sliding window with this batch.
+        recent = load_stored_events(
+            spark, pg_config, lo - timedelta(hours=MAX_WINDOW_HOURS), hi + timedelta(hours=MAX_WINDOW_HOURS)
+        ).cache()
+        anomaly_count = upsert_anomalies(recent, quakes, baseline_df, batch_id, cfg, pg_config)
+        t = lap("anomalies", t)
+        bvalue_count = upsert_bvalues(recent, quakes, long_term_b, batch_id, cfg, pg_config)
+        t = lap("bvalues", t)
+        recent.unpersist()
+
+    region_count = refresh_active_regions(spark, batch_id, cfg, pg_config)
+    t = lap("kmeans", t)
+    forecast_count = compute_aftershock_forecasts(batch_id, cfg, pg_config)
+    lap("omori", t)
     df.unpersist()
+    steps = " ".join(f"{k}={v:.1f}s" for k, v in timings.items())
     print(
-        f"Batch {batch_id}: events={event_count}, mainshocks={mainshock_count}, "
-        f"anomalies={anomaly_count}, bvalues={bvalue_count}, forecasts={forecast_count}",
+        f"Batch {batch_id}: received={len(rows)}, new_events={event_count}, mainshocks={mainshock_count}, "
+        f"anomaly_windows={anomaly_count}, bvalue_windows={bvalue_count}, active_regions={region_count}, "
+        f"forecasts={forecast_count} ({time.time() - started:.1f}s: {steps})",
         flush=True,
     )
 
@@ -397,8 +530,27 @@ def build_spark() -> SparkSession:
         SparkSession.builder.appName("RealTimeSeismicActivityAnalysis")
         .master(master)
         .config("spark.sql.session.timeZone", "UTC")
-        .config("spark.sql.shuffle.partitions", os.getenv("SPARK_SQL_SHUFFLE_PARTITIONS", "8"))
+        .config("spark.sql.shuffle.partitions", os.getenv("SPARK_SQL_SHUFFLE_PARTITIONS", "4"))
         .getOrCreate()
+    )
+
+
+def clean_events(raw: DataFrame) -> DataFrame:
+    """Parse, validate and enrich raw producer records (grid cell, coarse region, source)."""
+    return (
+        raw.withColumn("event_ts", F.to_timestamp("event_time"))
+        .withColumn("ingestion_ts", F.coalesce(F.to_timestamp("ingestion_time"), F.current_timestamp()))
+        .filter(
+            F.col("event_id").isNotNull()
+            & F.col("event_ts").isNotNull()
+            & F.col("longitude").between(-180.0, 180.0)
+            & F.col("latitude").between(-90.0, 90.0)
+        )
+        .withColumn("grid_lon", F.coalesce(F.col("grid_lon"), F.floor(F.col("longitude")).cast("int")))
+        .withColumn("grid_lat", F.coalesce(F.col("grid_lat"), F.floor(F.col("latitude")).cast("int")))
+        .withColumn("cell_id", F.coalesce(F.col("cell_id"), cell_id_expr(F.col("grid_lon"), F.col("grid_lat"))))
+        .withColumn("region_id", F.coalesce(F.col("region_id"), region_id_expr(F.col("longitude"), F.col("latitude"))))
+        .withColumn("source", F.coalesce(F.col("source"), F.lit("unknown")))
     )
 
 
@@ -406,6 +558,7 @@ def main() -> int:
     cfg = StreamConfig()
     kafka_config = KafkaConfig()
     pg_config = PostgresConfig()
+    ensure_schema(pg_config)
     spark = build_spark()
     spark.sparkContext.setLogLevel("WARN")
 
@@ -418,6 +571,12 @@ def main() -> int:
         ]
     )
     baseline_df = spark.read.schema(baseline_schema).option("header", True).csv(cfg.baseline_csv).cache()
+    long_term_b = load_long_term_bvalues(cfg.region_bvalue_csv)
+    print(
+        f"Loaded {baseline_df.count()} cell baselines from {cfg.baseline_csv} and "
+        f"{len(long_term_b)} regional b-values from {cfg.region_bvalue_csv}",
+        flush=True,
+    )
 
     kafka_raw = (
         spark.readStream.format("kafka")
@@ -429,31 +588,12 @@ def main() -> int:
     )
 
     raw = kafka_raw.select(F.from_json(F.col("value").cast("string"), EVENT_SCHEMA).alias("event")).select("event.*")
-    stream_df = (
-        raw.withColumn("event_ts", F.to_timestamp("event_time"))
-        .withColumn("ingestion_ts", F.coalesce(F.to_timestamp("ingestion_time"), F.current_timestamp()))
-        .withColumn("grid_lon", F.coalesce(F.col("grid_lon"), F.floor(F.col("longitude")).cast("int")))
-        .withColumn("grid_lat", F.coalesce(F.col("grid_lat"), F.floor(F.col("latitude")).cast("int")))
-        .withColumn("cell_id", F.coalesce(F.col("cell_id"), F.concat_ws(":", F.col("grid_lon"), F.col("grid_lat"))))
-        .withColumn(
-            "region_id",
-            F.coalesce(
-                F.col("region_id"),
-                F.concat(
-                    F.lit("R"),
-                    (F.floor(F.col("longitude") / 10) * 10).cast("int"),
-                    F.lit("_"),
-                    (F.floor(F.col("latitude") / 10) * 10).cast("int"),
-                ),
-            ),
-        )
-        .filter(F.col("event_id").isNotNull() & F.col("event_ts").isNotNull())
-        .withWatermark("event_ts", "7 days")
-        .dropDuplicates(["event_id"])
-    )
+    stream_df = clean_events(raw).withWatermark("event_ts", "7 days").dropDuplicates(["event_id"])
 
     query = (
-        stream_df.writeStream.foreachBatch(lambda df, bid: process_batch(df, bid, baseline_df, cfg, pg_config))
+        stream_df.writeStream.foreachBatch(
+            lambda df, bid: process_batch(df, bid, spark, baseline_df, long_term_b, cfg, pg_config)
+        )
         .outputMode("append")
         .option("checkpointLocation", cfg.checkpoint_dir)
         .trigger(processingTime=os.getenv("TRIGGER_INTERVAL", "10 seconds"))

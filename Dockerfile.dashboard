@@ -5,5 +5,7 @@ ENV PYTHONPATH=/opt/workspace
 WORKDIR /opt/workspace
 COPY requirements-dashboard.txt /tmp/requirements-dashboard.txt
 RUN pip install --no-cache-dir -r /tmp/requirements-dashboard.txt
+COPY requirements-test.txt /tmp/requirements-test.txt
+RUN pip install --no-cache-dir -r /tmp/requirements-test.txt
 COPY src /opt/workspace/src
 CMD ["python", "src/dashboard/app.py"]

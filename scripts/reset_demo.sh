@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
+# Reset the demo. Kafka messages, PostgreSQL rows, Spark checkpoints and the live producer's
+# seen-ID state all live in Docker volumes of the cvfix-seismic project, so they are reset together.
 set -euo pipefail
+cd "$(dirname "$0")/.."
 
-if [[ "${1:-}" == "--full" ]]; then
-  docker compose down -v --remove-orphans || true
-  printf 'Stopped containers and removed PostgreSQL/Kafka volumes.\n'
-fi
-
+docker compose --profile app --profile replay --profile live down -v --remove-orphans
+# Checkpoints of older versions of this project were kept on the host; they must never be reused.
 rm -rf data/checkpoints/seismic_stream
-mkdir -p data/checkpoints
-printf 'Spark checkpoint directory was reset. Kafka messages are stored in the kafka-data Docker volume; use ./scripts/reset_demo.sh --full to clear Kafka and PostgreSQL too.\n'
+printf 'Removed the cvfix-seismic containers and volumes (Kafka topic, PostgreSQL, Spark checkpoints, producer state).\n'

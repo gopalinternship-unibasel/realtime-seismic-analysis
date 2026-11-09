@@ -1,3 +1,21 @@
+# Distinct project name: containers, volumes and the network are all prefixed
+# "cvfix-seismic", so this copy never reuses state from older copies of the project.
+name: cvfix-seismic
+
+# One image for every Spark/Python service (master, workers, streaming job, producers, batch, tests).
+x-spark-image: &spark-image
+  build:
+    context: .
+    dockerfile: Dockerfile.spark
+  image: cvfix-seismic-spark:latest
+
+x-postgres-env: &postgres-env
+  POSTGRES_DB: ${POSTGRES_DB:-seismic}
+  POSTGRES_USER: ${POSTGRES_USER:-seismic}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-seismic}
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: 5432
+
 services:
   postgres:
     image: postgres:15-alpine
@@ -6,12 +24,13 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-seismic}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-seismic}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-seismic} -d ${POSTGRES_DB:-seismic}"]
+      # -h 127.0.0.1: only report healthy once the real server accepts TCP, not during init.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U ${POSTGRES_USER:-seismic} -d ${POSTGRES_DB:-seismic}"]
       interval: 5s
       timeout: 5s
       retries: 20
@@ -37,9 +56,13 @@ services:
       KAFKA_NUM_PARTITIONS: 3
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
 
-      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+      # Persistent log directory: the topic lives exactly as long as the Spark checkpoint
+      # volume below, so stored offsets always refer to this topic.
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
     ports:
-      - "9092:19092"
+      - "127.0.0.1:9092:19092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
     healthcheck:
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
       interval: 5s
@@ -61,54 +84,50 @@ services:
       --describe --topic $${KAFKA_TOPIC}"
 
   spark-master:
-    build:
-      context: .
-      dockerfile: Dockerfile.spark
+    <<: *spark-image
     command: >
       bash -lc "$$SPARK_HOME/bin/spark-class org.apache.spark.deploy.master.Master
       --host spark-master --port 7077 --webui-port 8080"
     ports:
-      - "7077:7077"
-      - "8080:8080"
+      - "127.0.0.1:7077:7077"
+      - "127.0.0.1:8080:8080"
     volumes:
       - ./src:/opt/workspace/src
       - ./data:/opt/workspace/data
 
   spark-worker-1:
-    build:
-      context: .
-      dockerfile: Dockerfile.spark
+    <<: *spark-image
     depends_on:
       - spark-master
     command: >
       bash -lc "$$SPARK_HOME/bin/spark-class org.apache.spark.deploy.worker.Worker
       spark://spark-master:7077 --cores 2 --memory 2G --webui-port 8081"
     ports:
-      - "8081:8081"
+      - "127.0.0.1:8081:8081"
     volumes:
       - ./src:/opt/workspace/src
       - ./data:/opt/workspace/data
+      # Executors write the streaming state store here, so driver and workers share it.
+      - spark-checkpoints:/opt/workspace/checkpoints
 
   spark-worker-2:
-    build:
-      context: .
-      dockerfile: Dockerfile.spark
+    <<: *spark-image
     depends_on:
       - spark-master
     command: >
       bash -lc "$$SPARK_HOME/bin/spark-class org.apache.spark.deploy.worker.Worker
       spark://spark-master:7077 --cores 2 --memory 2G --webui-port 8082"
     ports:
-      - "8082:8082"
+      - "127.0.0.1:8082:8082"
     volumes:
       - ./src:/opt/workspace/src
       - ./data:/opt/workspace/data
+      - spark-checkpoints:/opt/workspace/checkpoints
 
   streaming-job:
-    build:
-      context: .
-      dockerfile: Dockerfile.spark
+    <<: *spark-image
     profiles: ["app"]
+    restart: on-failure
     depends_on:
       postgres:
         condition: service_healthy
@@ -121,35 +140,36 @@ services:
       spark-worker-2:
         condition: service_started
     environment:
-      POSTGRES_DB: ${POSTGRES_DB:-seismic}
-      POSTGRES_USER: ${POSTGRES_USER:-seismic}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-seismic}
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: 5432
-
+      <<: *postgres-env
       SPARK_MASTER_URL: ${SPARK_MASTER_URL:-spark://spark-master:7077}
 
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       KAFKA_TOPIC: ${KAFKA_TOPIC:-seismic-events}
       KAFKA_STARTING_OFFSETS: earliest
 
-      CHECKPOINT_DIR: /opt/workspace/data/checkpoints/seismic_stream
+      CHECKPOINT_DIR: /opt/workspace/checkpoints/seismic_stream
       BASELINE_CSV: /opt/workspace/data/baseline/cell_baselines.csv
+      REGION_BVALUE_CSV: /opt/workspace/data/baseline/region_bvalues.csv
       Z_THRESHOLD: ${Z_THRESHOLD:-2.0}
       MIN_EVENTS_FOR_ANOMALY: ${MIN_EVENTS_FOR_ANOMALY:-3}
+      BVALUE_MIN_EVENTS: ${BVALUE_MIN_EVENTS:-20}
+      MAX_KMEANS_CLUSTERS: ${MAX_KMEANS_CLUSTERS:-5}
+      ACTIVE_REGION_HOURS: ${ACTIVE_REGION_HOURS:-24}
+      REGION_RADIUS_KM: ${REGION_RADIUS_KM:-300}
     command: >
       bash -lc "sleep 8 && spark-submit --master $${SPARK_MASTER_URL}
-      --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.5
-      --conf spark.sql.shuffle.partitions=8
+      --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.5,org.postgresql:postgresql:42.7.4
+      --conf spark.sql.shuffle.partitions=4
       src/streaming/streaming_job.py"
     volumes:
       - ./src:/opt/workspace/src
       - ./data:/opt/workspace/data
+      - ./sql:/opt/workspace/sql:ro
+      - spark-checkpoints:/opt/workspace/checkpoints
+      - ivy-cache:/root/.ivy2
 
   replay-producer:
-    build:
-      context: .
-      dockerfile: Dockerfile.spark
+    <<: *spark-image
     profiles: ["replay"]
     depends_on:
       streaming-job:
@@ -162,16 +182,16 @@ services:
       REPLAY_FILE: /opt/workspace/data/replay_catalog/sample_replay_events.jsonl
       EVENTS_PER_BATCH: 25
       REPLAY_SLEEP_SECONDS: 3
+      REPLAY_REBASE_TO_NOW: ${REPLAY_REBASE_TO_NOW:-true}
     command: bash -lc "python src/producer/replay_producer.py"
     volumes:
       - ./src:/opt/workspace/src
       - ./data:/opt/workspace/data
 
   live-producer:
-    build:
-      context: .
-      dockerfile: Dockerfile.spark
+    <<: *spark-image
     profiles: ["live"]
+    restart: on-failure
     depends_on:
       streaming-job:
         condition: service_started
@@ -182,31 +202,83 @@ services:
       KAFKA_TOPIC: ${KAFKA_TOPIC:-seismic-events}
       POLL_SECONDS: ${POLL_SECONDS:-60}
       USGS_URL: https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_hour.geojson
+      USGS_BACKFILL_URL: ${USGS_BACKFILL_URL-https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_week.geojson}
+      PRODUCER_STATE_FILE: /opt/workspace/state/producer_seen_ids.json
     command: bash -lc "python src/producer/live_usgs_producer.py"
     volumes:
       - ./src:/opt/workspace/src
       - ./data:/opt/workspace/data
+      # Seen-ID state is reset together with Kafka and PostgreSQL by `docker compose down -v`.
+      - producer-state:/opt/workspace/state
 
   dashboard:
     build:
       context: .
       dockerfile: Dockerfile.dashboard
+    image: cvfix-seismic-dashboard:latest
     profiles: ["app"]
     depends_on:
       postgres:
         condition: service_healthy
     environment:
-      POSTGRES_DB: ${POSTGRES_DB:-seismic}
-      POSTGRES_USER: ${POSTGRES_USER:-seismic}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-seismic}
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: 5432
+      <<: *postgres-env
       DASH_HOST: 0.0.0.0
       DASH_PORT: 8050
     ports:
-      - "8050:8050"
+      - "127.0.0.1:8050:8050"
     volumes:
       - ./src:/opt/workspace/src
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8050/', timeout=5)"]
+      interval: 10s
+      timeout: 6s
+      retries: 12
+
+  # One-off batch job: download USGS history and recompute the baselines on the Spark cluster.
+  #   docker compose --profile batch run --rm baselines
+  baselines:
+    <<: *spark-image
+    profiles: ["batch"]
+    depends_on:
+      - spark-master
+      - spark-worker-1
+      - spark-worker-2
+    environment:
+      SPARK_MASTER_URL: ${SPARK_MASTER_URL:-spark://spark-master:7077}
+      HISTORY_DAYS: ${HISTORY_DAYS:-90}
+      HISTORY_END: ${HISTORY_END:-}
+      HISTORICAL_CSV: /opt/workspace/data/historical/usgs_historical_events.csv
+    command: >
+      bash -lc "python src/batch/fetch_usgs_history.py &&
+      sleep 5 && spark-submit --master $${SPARK_MASTER_URL} src/batch/compute_baselines.py"
+    volumes:
+      - ./src:/opt/workspace/src
+      - ./data:/opt/workspace/data
+
+  # Unit tests (local Spark inside the container):  docker compose --profile test run --rm tests
+  tests:
+    <<: *spark-image
+    profiles: ["test"]
+    command: bash -lc "python -m pytest -q tests/pipeline"
+    volumes:
+      - ./src:/opt/workspace/src
+      - ./data:/opt/workspace/data
+      - ./tests:/opt/workspace/tests
+
+  dashboard-tests:
+    image: cvfix-seismic-dashboard:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    profiles: ["test"]
+    command: python -m pytest -q tests/dashboard
+    volumes:
+      - ./src:/opt/workspace/src
+      - ./tests:/opt/workspace/tests
 
 volumes:
   pgdata:
+  kafka-data:
+  spark-checkpoints:
+  ivy-cache:
+  producer-state:

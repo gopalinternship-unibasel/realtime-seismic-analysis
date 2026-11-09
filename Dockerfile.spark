@@ -12,11 +12,15 @@ ENV PYTHONPATH=/opt/workspace
 WORKDIR /opt/workspace
 COPY requirements-spark.txt /tmp/requirements-spark.txt
 RUN pip install --no-cache-dir -r /tmp/requirements-spark.txt
+# Test-only dependencies in their own layer so the large layer above stays cached.
+COPY requirements-test.txt /tmp/requirements-test.txt
+RUN pip install --no-cache-dir -r /tmp/requirements-test.txt
 
 ENV SPARK_HOME=/usr/local/lib/python3.11/site-packages/pyspark
 ENV PATH="$SPARK_HOME/bin:$SPARK_HOME/sbin:$PATH"
 
 COPY src /opt/workspace/src
+COPY sql /opt/workspace/sql
 COPY data /opt/workspace/data
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["bash"]
