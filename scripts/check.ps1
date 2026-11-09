@@ -36,8 +36,12 @@ try {
     foreach ($app in $master.activeapps) { Write-Host ("  running application: {0} ({1}, {2} cores)" -f $app.name, $app.id, $app.cores) }
 } catch { Write-Warning "Spark master UI not reachable: $_" }
 
-Write-Host "`n== Latest streaming micro-batches"
-(& docker compose --profile app logs --no-log-prefix streaming-job 2>$null) | Select-String -Pattern 'Batch \d+: received=' | Select-Object -Last 3 | ForEach-Object { Write-Host "  $($_.Line)" }
+Write-Host "`n== Latest streaming micro-batches (""empty"": nothing new in Kafka, or only duplicates)"
+$batchLines = @((& docker compose --profile app logs --no-log-prefix streaming-job 2>$null) | Select-String -Pattern '^Batch \d+:')
+$batchLines | Select-Object -Last 3 | ForEach-Object { Write-Host "  $($_.Line)" }
+$withData = @($batchLines | Where-Object { $_.Line -match 'received=' })
+if ($withData.Count -gt 0 -and $withData[-1].Line -ne $batchLines[-1].Line) { Write-Host "  last batch with new events: $($withData[-1].Line)" }
+if ($batchLines.Count -eq 0) { Write-Host '  none yet (the first micro-batch takes a few minutes after a fresh start)' }
 
 Write-Host "`n== PostgreSQL rows per data source"
 $sql = @"
