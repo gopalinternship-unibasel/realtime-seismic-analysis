@@ -1,0 +1,9 @@
+{
+  "type": "FeatureCollection",
+  "name": "sample_plate_boundaries_for_demo_only",
+  "features": [
+    {"type":"Feature","properties":{"plate":"Pacific/North American"},"geometry":{"type":"LineString","coordinates":[[-125,32],[-122,37],[-118,40],[-115,45]]}},
+    {"type":"Feature","properties":{"plate":"Nazca/South American"},"geometry":{"type":"LineString","coordinates":[[-81,-10],[-78,-20],[-74,-30],[-72,-40]]}},
+    {"type":"Feature","properties":{"plate":"Japan Trench"},"geometry":{"type":"LineString","coordinates":[[140,35],[144,38],[147,41]]}}
+  ]
+}

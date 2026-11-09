@@ -1,0 +1,5 @@
+region_id,long_term_b,event_count,completeness_mag
+R-130_+30,0.95,60,1.8
+R-130_+30,0.98,45,1.7
+R+140_+30,0.9,80,2.0
+R-080_-40,1.05,70,2.1

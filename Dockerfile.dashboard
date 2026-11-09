@@ -1,0 +1,9 @@
+FROM python:3.11-slim-bookworm
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/opt/workspace
+WORKDIR /opt/workspace
+COPY requirements-dashboard.txt /tmp/requirements-dashboard.txt
+RUN pip install --no-cache-dir -r /tmp/requirements-dashboard.txt
+COPY src /opt/workspace/src
+CMD ["python", "src/dashboard/app.py"]
