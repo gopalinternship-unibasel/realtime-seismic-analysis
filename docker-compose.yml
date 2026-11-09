@@ -98,13 +98,16 @@ services:
       - ./src:/opt/workspace/src
       - ./data:/opt/workspace/data
 
+  # Each worker offers 3 cores (6 in all): the streaming job takes 4 (spark.cores.max below) and
+  # the baselines batch job 2, so refresh_baselines.ps1 can run while the pipeline runs. With
+  # 2 + 2 cores the streaming job held all 4 and the batch job waited forever for resources.
   spark-worker-1:
     <<: *spark-image
     depends_on:
       - spark-master
     command: >
       bash -lc "$$SPARK_HOME/bin/spark-class org.apache.spark.deploy.worker.Worker
-      spark://spark-master:7077 --cores 2 --memory 2G --webui-port 8081"
+      spark://spark-master:7077 --cores 3 --memory 2G --webui-port 8081"
     ports:
       - "127.0.0.1:8081:8081"
     volumes:
@@ -119,7 +122,7 @@ services:
       - spark-master
     command: >
       bash -lc "$$SPARK_HOME/bin/spark-class org.apache.spark.deploy.worker.Worker
-      spark://spark-master:7077 --cores 2 --memory 2G --webui-port 8082"
+      spark://spark-master:7077 --cores 3 --memory 2G --webui-port 8082"
     ports:
       - "127.0.0.1:8082:8082"
     volumes:
@@ -159,11 +162,14 @@ services:
       MAX_KMEANS_CLUSTERS: ${MAX_KMEANS_CLUSTERS:-5}
       ACTIVE_REGION_HOURS: ${ACTIVE_REGION_HOURS:-24}
       REGION_RADIUS_KM: ${REGION_RADIUS_KM:-300}
+      # Cores the streaming job may hold; the rest of the cluster stays free for batch jobs.
+      STREAMING_MAX_CORES: ${STREAMING_MAX_CORES:-4}
     # exec: spark-submit replaces the shell, so it receives SIGTERM on "docker compose stop".
     command: >
       bash -lc "sleep 8 && exec spark-submit --master $${SPARK_MASTER_URL}
       --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.5,org.postgresql:postgresql:42.7.4
       --conf spark.sql.shuffle.partitions=4
+      --conf spark.cores.max=$${STREAMING_MAX_CORES}
       src/streaming/streaming_job.py"
     volumes:
       - ./src:/opt/workspace/src
@@ -254,9 +260,15 @@ services:
       HISTORY_DAYS: ${HISTORY_DAYS:-90}
       HISTORY_END: ${HISTORY_END:-}
       HISTORICAL_CSV: /opt/workspace/data/historical/usgs_historical_events.csv
+      SPARK_BATCH_CORES: ${SPARK_BATCH_CORES:-2}
+    # wait_for_cores.py fails with a clear message (instead of Spark waiting forever) when the
+    # cluster has no free cores: before the download and again before spark-submit.
     command: >
-      bash -lc "python src/batch/fetch_usgs_history.py &&
-      sleep 5 && spark-submit --master $${SPARK_MASTER_URL} src/batch/compute_baselines.py"
+      bash -lc "python src/batch/wait_for_cores.py &&
+      python src/batch/fetch_usgs_history.py &&
+      python src/batch/wait_for_cores.py &&
+      spark-submit --master $${SPARK_MASTER_URL} --conf spark.cores.max=$${SPARK_BATCH_CORES}
+      src/batch/compute_baselines.py"
     volumes:
       - ./src:/opt/workspace/src
       - ./data:/opt/workspace/data
