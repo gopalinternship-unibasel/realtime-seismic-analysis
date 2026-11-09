@@ -1,0 +1,17 @@
+# Local configuration (copy from .env.example)
+.env
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Runtime state (lives in Docker volumes now; old host copies are stale)
+data/checkpoints/
+data/producer_seen_ids.json
+data/**/*.tmp
+
+# Browser test
+tests/e2e/node_modules/
+tests/e2e/screenshots/
+tests/e2e/package-lock.json
