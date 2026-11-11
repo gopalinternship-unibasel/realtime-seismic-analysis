@@ -133,7 +133,10 @@ services:
   streaming-job:
     <<: *spark-image
     profiles: ["app"]
-    restart: on-failure
+    # At most 5 restarts in a row. Without a limit, a PC or Docker restart brought this
+    # container back on its own (a stopped job exits 143, which counts as a failure) while
+    # Kafka, Spark and PostgreSQL stayed down, and it kept failing until someone stopped it.
+    restart: on-failure:5
     # On "docker compose stop" the Spark driver gets SIGTERM and stops its SparkContext
     # (executors, Kafka consumer, a micro-batch in flight). That took longer than the default
     # 10 s on a busy machine, which ended in SIGKILL (exit 137). Give it time to exit by itself.
@@ -205,7 +208,7 @@ services:
   live-producer:
     <<: *spark-image
     profiles: ["live"]
-    restart: on-failure
+    restart: on-failure:5
     depends_on:
       streaming-job:
         condition: service_started
