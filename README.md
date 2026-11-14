@@ -2,6 +2,8 @@
 
 This is a runnable implementation of the DIS workshop idea from the abstract: a streaming seismic analytics system using the USGS real-time GeoJSON feed, Apache Kafka (KRaft), Spark Structured Streaming on a standalone cluster, PostgreSQL, and a Plotly Dash dashboard, all started with Docker Compose.
 
+**Live dashboard:** <https://gopalinternship-unibasel.github.io/realtime-seismic-analysis/> (a static copy that the real pipeline writes on GitHub Actions every hour; see [Live dashboard](#live-dashboard)).
+
 For exact start, stop and test commands on Windows see **[RUNNING.md](RUNNING.md)**.
 
 ## What is implemented
