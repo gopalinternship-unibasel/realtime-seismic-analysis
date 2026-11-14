@@ -181,7 +181,7 @@ Upgrading a stack that ran an older version: `start.ps1` without `-Reset` is eno
 - The dashboard runs on Flask's development server (fine on localhost, not for a public deployment).
 - Spark runs only inside the containers; running the job with a Windows-host Python/Spark is not supported.
 
-## 11. What only Gopal can do
+## 11. What only the repository owner can do
 
 - Decide whether to change the CV wording now that the claims are backed by the running code (see the commit messages for what changed).
 - Push the commits (they are local only) and decide whether to copy the fixes back to the original Desktop folder.
