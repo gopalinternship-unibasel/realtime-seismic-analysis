@@ -29,9 +29,14 @@ DASH_HOST = os.getenv("DASH_HOST", "127.0.0.1")
 DASH_PORT = int(os.getenv("DASH_PORT", "8050"))
 REFRESH_MS = int(os.getenv("DASH_REFRESH_MS", "10000"))
 
+def database_url() -> str:
+    """The connection URL from the POSTGRES_* settings (also used by src/export/export_site.py)."""
+    return f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+
+
 # connect_timeout: an unreachable database fails a refresh in seconds instead of hanging it.
 ENGINE = create_engine(
-    f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}",
+    database_url(),
     pool_pre_ping=True,
     connect_args={"connect_timeout": int(os.getenv("DB_CONNECT_TIMEOUT", "5"))},
 )
@@ -77,7 +82,7 @@ def describe_db_error(exc: Exception) -> str:
     return first[:240]
 
 
-def query_df(sql: str, params: dict | None = None) -> pd.DataFrame:
+def query_df(sql: str, params: dict | None = None, engine=None) -> pd.DataFrame:
     """Run a query; raise DatabaseUnavailable when PostgreSQL cannot answer it.
 
     It used to return an empty DataFrame on any error, so with PostgreSQL stopped the page
@@ -85,7 +90,7 @@ def query_df(sql: str, params: dict | None = None) -> pd.DataFrame:
     empty feed. The callbacks catch DatabaseUnavailable and say that the database is down.
     """
     try:
-        return pd.read_sql_query(text(sql), ENGINE, params=params or {})
+        return pd.read_sql_query(text(sql), engine or ENGINE, params=params or {})
     except SQLAlchemyError as exc:
         reason = describe_db_error(exc)
         print(f"Dashboard query failed: {reason}", flush=True)
@@ -303,6 +308,36 @@ def forecast_summary(mainshock: dict | None, forecast: dict | None) -> list:
     return lines
 
 
+def forecast_series(forecast: dict, hours_after: list[float]) -> dict:
+    """The numbers the Omori-Utsu chart draws, shared with src/export/export_site.py.
+
+    origin: hour after the mainshock where the six-hour forecast starts; hist_x and hist_y: observed
+    aftershocks per hour (bar centres and counts); curve_x and curve_y: the fitted rate (aftershocks
+    per hour); point_x and point_y: the expected aftershocks in each of the next six hours.
+    """
+    k, c, p = float(forecast["k_value"]), float(forecast["c_value"]), float(forecast["p_value"])
+    origin = forecast.get("forecast_origin_hours")
+    if origin is None or pd.isna(origin):
+        origin = float(np.ceil(max(hours_after))) if hours_after else 0.0
+    origin = float(origin)
+    hist_x, hist_y = [], []
+    if hours_after:
+        max_hour = int(np.ceil(max(hours_after)))
+        counts, edges = np.histogram(hours_after, bins=np.arange(0, max_hour + 2, 1))
+        hist_x, hist_y = list(edges[:-1] + 0.5), list(counts)
+    curve_h = np.linspace(0.25, origin + 6, 200)
+    return {
+        "origin": origin,
+        "hist_x": hist_x,
+        "hist_y": hist_y,
+        "curve_x": list(curve_h),
+        "curve_y": [omori_rate(k, c, p, h) for h in curve_h],
+        # Expected aftershocks in each of the next six hours, plotted at the middle of the hour.
+        "point_x": [origin + h + 0.5 for h in range(6)],
+        "point_y": [omori_expected(k, c, p, origin + h, origin + h + 1) for h in range(6)],
+    }
+
+
 def build_forecast_chart(mainshock: dict | None, forecast: dict | None, hours_after: list[float]) -> go.Figure:
     fig = go.Figure()
     if not mainshock or not forecast:
@@ -312,28 +347,23 @@ def build_forecast_chart(mainshock: dict | None, forecast: dict | None, hours_af
         return fig
 
     k, c, p = float(forecast["k_value"]), float(forecast["c_value"]), float(forecast["p_value"])
-    origin = forecast.get("forecast_origin_hours")
-    if origin is None or pd.isna(origin):
-        origin = float(np.ceil(max(hours_after))) if hours_after else 0.0
-    origin = float(origin)
+    series = forecast_series(forecast, hours_after)
+    origin = series["origin"]
 
     if hours_after:
-        max_hour = int(np.ceil(max(hours_after)))
-        counts, edges = np.histogram(hours_after, bins=np.arange(0, max_hour + 2, 1))
         fig.add_trace(
             go.Bar(
-                x=(edges[:-1] + 0.5),
-                y=counts,
+                x=np.array(series["hist_x"]),
+                y=np.array(series["hist_y"]),
                 width=0.9,
                 name="Observed aftershocks per hour",
                 marker_color="#94a3b8",
             )
         )
-    curve_h = np.linspace(0.25, origin + 6, 200)
     fig.add_trace(
         go.Scatter(
-            x=curve_h,
-            y=[omori_rate(k, c, p, h) for h in curve_h],
+            x=np.array(series["curve_x"]),
+            y=series["curve_y"],
             mode="lines",
             # Short: a long legend entry is clipped on a narrow screen (the parameters are in the summary).
             name="Fitted Omori-Utsu rate",
@@ -341,11 +371,10 @@ def build_forecast_chart(mainshock: dict | None, forecast: dict | None, hours_af
             line={"color": "#1d4ed8", "width": 2},
         )
     )
-    # Expected aftershocks in each of the next six hours, plotted at the middle of the hour.
     fig.add_trace(
         go.Scatter(
-            x=[origin + h + 0.5 for h in range(6)],
-            y=[omori_expected(k, c, p, origin + h, origin + h + 1) for h in range(6)],
+            x=series["point_x"],
+            y=series["point_y"],
             mode="markers",
             name="Forecast, next 6 h",
             marker={"color": "#dc2626", "size": 9},
@@ -456,7 +485,7 @@ def load_bvalue_region_options(sources: list[str], time_range: str) -> pd.DataFr
     )
 
 
-def load_mainshock_options(sources: list[str]) -> pd.DataFrame:
+def load_mainshock_options(sources: list[str], engine=None) -> pd.DataFrame:
     """Mainshocks with a forecast, newest active first.
 
     M >= 5 events that belong to the sequence of a larger event (larger_event_id set by the
@@ -481,10 +510,11 @@ def load_mainshock_options(sources: list[str]) -> pd.DataFrame:
         LIMIT 200
         """,
         {"sources": sources},
+        engine,
     )
 
 
-def load_forecast_detail(mainshock_id: str) -> tuple[dict | None, dict | None, list[float]]:
+def load_forecast_detail(mainshock_id: str, engine=None) -> tuple[dict | None, dict | None, list[float]]:
     mainshock = query_df(
         """
         SELECT m.event_id, m.event_time, m.magnitude, m.longitude, m.latitude, m.place, m.source, m.active,
@@ -492,6 +522,7 @@ def load_forecast_detail(mainshock_id: str) -> tuple[dict | None, dict | None, l
         FROM mainshocks m WHERE m.event_id = :id
         """,
         {"id": mainshock_id},
+        engine,
     )
     if mainshock.empty:
         return None, None, []
@@ -499,6 +530,7 @@ def load_forecast_detail(mainshock_id: str) -> tuple[dict | None, dict | None, l
     forecast = query_df(
         "SELECT * FROM aftershock_forecasts WHERE mainshock_id = :id ORDER BY fitted_at DESC, id DESC LIMIT 1",
         {"id": mainshock_id},
+        engine,
     )
     # The same aftershock search as the streaming job (compute_aftershock_forecasts).
     lat0, lat1, lon0, lon1, lon2, lon3 = search_box_params(float(main["longitude"]), float(main["latitude"]))
@@ -523,6 +555,7 @@ def load_forecast_detail(mainshock_id: str) -> tuple[dict | None, dict | None, l
             "lon2": lon2,
             "lon3": lon3,
         },
+        engine,
     )
     rows = []
     if not candidates.empty:
