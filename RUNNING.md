@@ -187,3 +187,29 @@ Upgrading a stack that ran an older version: `start.ps1` without `-Reset` is eno
 - Push the commits (they are local only) and decide whether to copy the fixes back to the original Desktop folder.
 - Remove the old stopped containers, images and volumes of earlier copies (`seismic-spark-dis-workshop*`) if he no longer needs them; they were left untouched.
 - Remove the per-service images `cvfix-seismic-spark-master`, `-spark-worker-1`, `-spark-worker-2`, `-streaming-job` and `-replay-producer` if he wants the space back (`docker image rm ...`): an earlier version of this copy's compose file built them; the current one uses only `cvfix-seismic-spark` and `cvfix-seismic-dashboard`.
+
+## 12. Live dashboard on GitHub Pages
+
+The public page <https://gopalinternship-unibasel.github.io/realtime-seismic-analysis/> is a static copy of the dashboard, written by the real pipeline. The workflow `.github/workflows/pages.yml` ("Live dashboard") runs on a schedule (every hour at minute 7), on `workflow_dispatch` and on a push to `main` that changes the page, the source, the SQL, the data or the Compose and Docker files. One job on `ubuntu-latest`:
+
+1. `scripts/start.ps1 -Mode both -TimeoutSeconds 1800` starts the stack with the live and the replay producer.
+2. It waits at most 20 minutes until the replay results equal the figures in section 4 (the query of the "stack" job in `ci.yml`), the live source has stored events and no table has changed its row counts for 60 seconds. If that is not reached the job fails and nothing is published (the page keeps the last good version).
+3. It runs the exporter inside the Compose network, with the dashboard image and a bind-mounted folder, and puts `site/` and the exported `data/` into one folder.
+4. It publishes that folder with the Pages actions (`configure-pages`, `upload-pages-artifact`, `deploy-pages`). The runs share the concurrency group `pages` and never cancel a deploy in progress.
+5. If anything failed it prints `scripts/check.ps1` and the logs, and it always stops the stack. The last step enables the workflow again through the API, so that GitHub does not switch the schedule off after 60 days without repository activity.
+
+One-time setting for the repository owner: Settings, Pages, Source: GitHub Actions. Without it the deploy step fails.
+
+What the page shows: the same views and controls as the Dash dashboard (data source, time range, minimum magnitude, map, counters, anomalous cells, active regions, b-value chart, mainshock selector with the Omori-Utsu fit and the six-hour forecast, the stale-forecast marker), plus the generation time, the code version and a pipeline status block. Time ranges count back from the time the data was written, not from the visitor's clock. The 10-second auto-refresh is not part of it: the page shows one run. The files are in `site/` (`index.html`, `app.js`, `style.css`, no build step; Plotly.js 2.35.3 from cdnjs.cloudflare.com). The comment at the top of `site/app.js` says which rule of `src/dashboard/app.py` each filter follows and what the exporter precomputes.
+
+Run the exporter by hand (the stack, or at least PostgreSQL, must be running; it reads the same `POSTGRES_*` settings as the dashboard):
+
+```powershell
+docker compose --profile app run --rm --no-deps -v "${PWD}/_export:/out" dashboard python -m src.export.export_site --out /out
+```
+
+It writes `meta.json`, `events.json`, `anomaly_windows.json`, `active_regions.json`, `bvalue_windows.json`, `mainshocks.json` and `status.json` (together well under 1 MB for a week of live data). `--max-events N` (or `EXPORT_MAX_EVENTS`) limits the events to the newest N; the default is 50,000. To look at the page locally, copy `site/` and the exported files into one folder with the JSON in a `data` subfolder and serve it, for example `python -m http.server 8000` inside that folder, then open <http://localhost:8000>. The exporter tests run with `scripts/test.ps1` (`tests/dashboard/test_export_site.py`, against `test-postgres`).
+
+Limits: the page is at most an hour old and often a few minutes older, because a run takes about 10 to 20 minutes; a run that cannot reach the USGS feed fails and leaves the old page; the runner starts from an empty database each time, so the page shows the live week and the replay demo, no longer history.
+
+`Dockerfile.spark` also builds on arm64: the JVM folder name depends on the CPU, so the image links it to the fixed path `/usr/lib/jvm/java-17` and `JAVA_HOME` points there.

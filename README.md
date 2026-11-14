@@ -145,13 +145,19 @@ docker compose exec postgres psql -U seismic -d seismic -c "SELECT source, regio
 docker compose exec postgres psql -U seismic -d seismic -c "SELECT mainshock_id, aftershock_count, p_value, next_six_hour_expected FROM aftershock_forecasts ORDER BY fitted_at DESC LIMIT 10;"
 ```
 
+## Live dashboard
+
+Public page: <https://gopalinternship-unibasel.github.io/realtime-seismic-analysis/>
+
+No free server is large enough to keep Kafka, a Spark cluster, PostgreSQL and the dashboard running all day. So the public page is a static copy. The workflow `.github/workflows/pages.yml` ("Live dashboard") starts the whole pipeline on a GitHub runner every hour (live USGS feed and replay demo), waits until the results are stored, exports what the dashboard shows as JSON (`src/export/export_site.py`) and publishes it with the page in `site/` on GitHub Pages. The page shows the time of that run; it is not a continuously running server. The Dash dashboard on `http://localhost:8050` stays the live version. Details and how to run the exporter by hand are in RUNNING.md, section 12.
+
 ## Tests
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\test.ps1
 ```
 
-runs `tests/pipeline` (geo, producers, the cleaning rules with every reject reason, the streaming ingest path with de-duplication by arrival time across micro-batches that keeps old events and logs late arrivals, b-value and Omori models, declustering and the aftershock search box, sliding windows across micro-batches, replay windows that do not depend on the start minute, baselines, K-Means with more separate hot spots than the old cap and the radius flag, the cluster-cores check) with a local SparkSession in the Spark image, `tests/pipeline/test_forecasts_db.py` and `tests/pipeline/test_ingest_db.py` against a throwaway PostgreSQL (`test-postgres`, data in memory: every active mainshock forecast, a large sequence forecast once, unchanged fits not stored twice, antimeridian and high-latitude aftershocks, `process_batch` with rejected records, a text magnitude and a 10-day-old event, the stored region radius flag), and `tests/dashboard` in the dashboard image (including the database-outage state). `tests/e2e/dashboard.e2e.mjs` drives the running dashboard in headless Edge, at desktop and phone width (see RUNNING.md).
+runs `tests/pipeline` (geo, producers, the cleaning rules with every reject reason, the streaming ingest path with de-duplication by arrival time across micro-batches that keeps old events and logs late arrivals, b-value and Omori models, declustering and the aftershock search box, sliding windows across micro-batches, replay windows that do not depend on the start minute, baselines, K-Means with more separate hot spots than the old cap and the radius flag, the cluster-cores check) with a local SparkSession in the Spark image, `tests/pipeline/test_forecasts_db.py` and `tests/pipeline/test_ingest_db.py` against a throwaway PostgreSQL (`test-postgres`, data in memory: every active mainshock forecast, a large sequence forecast once, unchanged fits not stored twice, antimeridian and high-latitude aftershocks, `process_batch` with rejected records, a text magnitude and a 10-day-old event, the stored region radius flag), and `tests/dashboard` in the dashboard image (including the database-outage state and the exporter of the static page, `test_export_site.py`, against the same throwaway PostgreSQL). `tests/e2e/dashboard.e2e.mjs` drives the running dashboard in headless Edge, at desktop and phone width (see RUNNING.md).
 
 ## How the pipeline maps to the workshop abstract
 
