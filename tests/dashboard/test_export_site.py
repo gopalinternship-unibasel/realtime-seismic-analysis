@@ -189,6 +189,10 @@ def test_mainshock_forecast_and_curve_points(engine, tmp_path):
     assert (f["next_hour"], f["next_six_hours"], f["r_squared"], f["origin_hours"]) == (1.5, 8.5, 0.87, 10.0)
     # The forecast starts at the mainshock plus 10 hours; the clock is 3 hours later, so it is stale.
     assert f["start"] == "2026-11-09T12:00:00Z"
+    gap = datetime.fromisoformat(item["clock"].replace("Z", "+00:00")) - datetime.fromisoformat(
+        f["start"].replace("Z", "+00:00")
+    )
+    assert gap.total_seconds() == 3 * 3600 > shocks["stale_seconds"]
     # Observed aftershocks per hour: the far event is outside 300 km; the five near ones fill hours 0, 1, 2, 4, 9.
     assert f["hist"] == [1, 1, 1, 0, 1, 0, 0, 0, 0, 1, 0]
     assert len(f["curve"]["x"]) == len(f["curve"]["y"]) == 200

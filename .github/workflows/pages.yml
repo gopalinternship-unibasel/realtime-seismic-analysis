@@ -20,6 +20,7 @@ on:
       - 'Dockerfile.*'
       - 'requirements-*.txt'
       - 'scripts/start.ps1'
+      - '.env.example'
       - '.github/workflows/pages.yml'
 
 permissions:
@@ -61,7 +62,7 @@ jobs:
             || '|' || (SELECT COUNT(*) FROM bvalue_windows WHERE source='replay')
             || '|' || (SELECT COUNT(DISTINCT f.mainshock_id) FROM aftershock_forecasts f JOIN mainshocks m ON m.event_id = f.mainshock_id WHERE m.source='replay')
             || '|' || COALESCE((SELECT f.aftershock_count FROM aftershock_forecasts f JOIN mainshocks m ON m.event_id = f.mainshock_id WHERE m.source='replay' ORDER BY f.fitted_at DESC, f.id DESC LIMIT 1), 0)
-            || '|' || (SELECT COUNT(*) FROM rejected_records)"
+            || '|' || (SELECT COUNT(*) FROM rejected_records WHERE source='replay' OR source IS NULL)"
           live_sql="SELECT COUNT(*) FROM seismic_events WHERE source='usgs-live'"
           sig_sql="SELECT (SELECT COUNT(*) FROM seismic_events) || '/' || (SELECT COUNT(*) FROM anomaly_windows)
             || '/' || (SELECT COUNT(*) FROM active_regions) || '/' || (SELECT COUNT(*) FROM bvalue_windows)

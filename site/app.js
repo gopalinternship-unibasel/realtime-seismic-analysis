@@ -567,10 +567,14 @@
     var meta = D.meta, ago = Math.max(0, Date.now() - D.now), hours = ago / 3600000;
     var origin = $("origin");
     origin.textContent = "";
-    var agoText = hours < 1 ? Math.max(1, Math.round(ago / 60000)) + " minutes ago" : hours < 48 ? fixed(hours, 1) + " hours ago" : Math.round(hours / 24) + " days ago";
-    origin.appendChild(document.createTextNode(
-      "This page was written by the pipeline's latest run on GitHub Actions (Kafka, Spark and PostgreSQL started there), at " +
-      fmtSeconds(D.now) + " UTC (" + agoText + "). It is refreshed on a schedule, every hour; it is not a continuously running server. "));
+    var minutes = Math.max(1, Math.round(ago / 60000));
+    var agoText = hours < 1 ? minutes + (minutes === 1 ? " minute ago" : " minutes ago") : hours < 48 ? fixed(hours, 1) + " hours ago" : Math.round(hours / 24) + " days ago";
+    // meta.commit is set by the GitHub Actions run; an export made by hand has none.
+    origin.appendChild(document.createTextNode(meta.commit
+      ? "This page was written by the pipeline's latest run on GitHub Actions (Kafka, Spark and PostgreSQL started there), at " +
+        fmtSeconds(D.now) + " UTC (" + agoText + "). It is refreshed on a schedule, every hour; it is not a continuously running server. "
+      : "This page was written by a local run of the exporter, at " + fmtSeconds(D.now) + " UTC (" + agoText +
+        "). It shows that one run; it is not a continuously running server. "));
     if (meta.commit) {
       origin.appendChild(document.createTextNode("Code version: "));
       origin.appendChild(el("a", { href: REPO_URL + "/commit/" + meta.commit, text: meta.commit.slice(0, 7) }));

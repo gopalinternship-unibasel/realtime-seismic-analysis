@@ -198,7 +198,7 @@ The public page <https://gopalinternship-unibasel.github.io/realtime-seismic-ana
 4. It publishes that folder with the Pages actions (`configure-pages`, `upload-pages-artifact`, `deploy-pages`). The runs share the concurrency group `pages` and never cancel a deploy in progress.
 5. If anything failed it prints `scripts/check.ps1` and the logs, and it always stops the stack. The last step enables the workflow again through the API, so that GitHub does not switch the schedule off after 60 days without repository activity.
 
-One-time setting for the repository owner: Settings, Pages, Source: GitHub Actions. Without it the deploy step fails.
+One-time setting for the repository owner: Settings, Pages, Source: GitHub Actions. Set it before the first push that touches the workflow: without it the run starts the whole pipeline and then fails at the deploy step.
 
 What the page shows: the same views and controls as the Dash dashboard (data source, time range, minimum magnitude, map, counters, anomalous cells, active regions, b-value chart, mainshock selector with the Omori-Utsu fit and the six-hour forecast, the stale-forecast marker), plus the generation time, the code version and a pipeline status block. Time ranges count back from the time the data was written, not from the visitor's clock. The 10-second auto-refresh is not part of it: the page shows one run. The files are in `site/` (`index.html`, `app.js`, `style.css`, no build step; Plotly.js 2.35.3 from cdnjs.cloudflare.com). The comment at the top of `site/app.js` says which rule of `src/dashboard/app.py` each filter follows and what the exporter precomputes.
 
