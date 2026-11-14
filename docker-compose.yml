@@ -321,9 +321,15 @@ services:
       context: .
       dockerfile: Dockerfile.dashboard
     profiles: ["test"]
+    # The exporter tests (tests/dashboard/test_export_site.py) use test-postgres like the pipeline tests.
+    environment:
+      TEST_POSTGRES_HOST: ${TEST_POSTGRES_HOST:-}
+      REQUIRE_TEST_DB: ${REQUIRE_TEST_DB:-0}
+      SCHEMA_SQL: /opt/workspace/sql/init.sql
     command: python -m pytest -q tests/dashboard
     volumes:
       - ./src:/opt/workspace/src
+      - ./sql:/opt/workspace/sql:ro
       - ./tests:/opt/workspace/tests
 
 volumes:

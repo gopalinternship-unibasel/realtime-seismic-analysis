@@ -24,8 +24,10 @@ jobs:
       - name: Start the throwaway test database
         run: docker compose --profile test up -d --wait test-postgres
 
-      - name: Dashboard tests
-        run: docker compose --profile test run --rm --no-deps dashboard-tests
+      - name: Dashboard tests (include the exporter of the static page, against the test database)
+        run: >
+          docker compose --profile test run --rm --no-deps
+          -e TEST_POSTGRES_HOST=test-postgres -e REQUIRE_TEST_DB=1 dashboard-tests
 
       - name: Pipeline tests (local Spark session, forecasting against PostgreSQL)
         run: >

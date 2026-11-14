@@ -16,7 +16,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Building the test images failed' }
 & docker compose --profile test up -d --wait test-postgres
 if ($LASTEXITCODE -ne 0) { throw 'Starting the test database failed' }
 
-& docker compose --profile test run --rm --no-deps dashboard-tests
+& docker compose --profile test run --rm --no-deps -e TEST_POSTGRES_HOST=test-postgres -e REQUIRE_TEST_DB=1 dashboard-tests
 $dashboard = $LASTEXITCODE
 & docker compose --profile test run --rm --no-deps -e TEST_POSTGRES_HOST=test-postgres -e REQUIRE_TEST_DB=1 tests
 $pipeline = $LASTEXITCODE
