@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  tests:
+    name: Pipeline and dashboard tests (in the project's images)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Settings file
+        run: cp .env.example .env
+
+      - name: Build the test images
+        run: docker compose --profile test build tests dashboard-tests
+
+      - name: Start the throwaway test database
+        run: docker compose --profile test up -d --wait test-postgres
+
+      - name: Dashboard tests
+        run: docker compose --profile test run --rm --no-deps dashboard-tests
+
+      - name: Pipeline tests (local Spark session, forecasting against PostgreSQL)
+        run: >
+          docker compose --profile test run --rm --no-deps
+          -e TEST_POSTGRES_HOST=test-postgres -e REQUIRE_TEST_DB=1 tests
+
+      - name: Remove the test database
+        if: always()
+        run: docker compose --profile test rm -s -f test-postgres
