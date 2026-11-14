@@ -179,6 +179,7 @@ def test_mainshock_forecast_and_curve_points(engine, tmp_path):
     shocks = data["mainshocks.json"]
     assert shocks["active_counts"] == {"replay": 1}
     assert shocks["stale_seconds"] == 1
+    assert (shocks["radius_km"], shocks["window_days"], shocks["min_aftershocks_for_p"]) == (300, 7, 5)
     assert len(shocks["items"]) == 1
     item = shocks["items"][0]
     assert item["id"] == "main" and item["active"] is True and item["mag"] == 5.6

@@ -223,6 +223,10 @@ def export_mainshocks(engine) -> dict:
         # Same rule as is_stale() in app.py: stale when the forecast starts more than this many seconds
         # before its source's clock.
         "stale_seconds": dash.STALE_FORECAST_SECONDS,
+        # The numbers in the text above the chart (forecast_summary in app.py).
+        "radius_km": dash.AFTERSHOCK_RADIUS_KM,
+        "window_days": dash.AFTERSHOCK_WINDOW_DAYS,
+        "min_aftershocks_for_p": dash.MIN_AFTERSHOCKS_FOR_P,
         "active_counts": {r.source: int(r.n) for r in counts.itertuples(index=False)},
         "items": items,
     }

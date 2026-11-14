@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Real-Time Seismic Activity Analysis</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="page">
+  <header>
+    <h1>Real-Time Seismic Activity Analysis</h1>
+    <p class="subtitle">Kafka + Spark Structured Streaming + PostgreSQL, fed by the USGS GeoJSON feed or the replay demo catalogue</p>
+    <p id="origin" class="origin">Loading the data of the latest pipeline run ...</p>
+    <div id="last-updated" class="updated"></div>
+    <div id="load-error" class="db-error" role="alert" hidden></div>
+  </header>
+
+  <section id="controls" class="card controls-grid" aria-label="Controls">
+    <fieldset class="control">
+      <legend>Data source</legend>
+      <label><input type="radio" name="source" value="all" checked> Both</label>
+      <label><input type="radio" name="source" value="usgs-live"> Live USGS feed</label>
+      <label><input type="radio" name="source" value="replay"> Replay demo</label>
+    </fieldset>
+    <div class="control">
+      <label for="time-range" class="label">Time range</label>
+      <select id="time-range">
+        <option value="6h">Last 6 hours</option>
+        <option value="24h">Last 24 hours</option>
+        <option value="72h">Last 3 days</option>
+        <option value="7d" selected>Last 7 days</option>
+        <option value="30d">Last 30 days</option>
+        <option value="all">All time</option>
+      </select>
+    </div>
+    <div class="control">
+      <label for="min-mag" class="label">Minimum magnitude (map and event count): <output id="min-mag-value">all</output></label>
+      <input type="range" id="min-mag" min="0" max="7" step="0.5" value="0">
+      <div class="marks" aria-hidden="true"><span>all</span><span>1</span><span>2</span><span>3</span><span>4</span><span>5</span><span>6</span><span>7</span></div>
+    </div>
+  </section>
+
+  <section id="metrics" class="metrics-grid" aria-label="Counts"></section>
+
+  <section class="card wide-card">
+    <div id="world-map" class="plot map-plot"></div>
+  </section>
+
+  <section class="card wide-card scroll-x">
+    <h3 class="card-title">Active seismic regions (K-Means over anomalous cells)</h3>
+    <div id="regions-table"></div>
+  </section>
+
+  <div class="charts-grid">
+    <section class="card">
+      <h3 class="card-title">Gutenberg–Richter b-value (24 h sliding windows)</h3>
+      <div class="label" id="bvalue-regions-label">Regions (10° × 10°)</div>
+      <details id="bvalue-regions" class="multi" aria-labelledby="bvalue-regions-label">
+        <summary id="bvalue-regions-summary">Choose regions</summary>
+        <div id="bvalue-regions-list" class="multi-list"></div>
+      </details>
+      <div id="bvalue-chart" class="plot chart-plot"></div>
+    </section>
+    <section class="card">
+      <h3 class="card-title">Omori–Utsu aftershock forecast</h3>
+      <label for="mainshock" class="label">Mainshock (M ≥ 5)</label>
+      <select id="mainshock"></select>
+      <div id="forecast-summary" class="forecast-summary"></div>
+      <div id="forecast-chart" class="plot chart-plot"></div>
+    </section>
+  </div>
+
+  <section class="card wide-card">
+    <details id="status">
+      <summary>Pipeline status of the latest run</summary>
+      <div id="status-body"></div>
+    </details>
+  </section>
+
+  <footer>
+    <p>The figures are the rows that the pipeline stored in PostgreSQL during its latest run on GitHub Actions. Time ranges count back from the time the data was written. Source code, tests and the local way to run the live dashboard: <a id="repo-link" href="https://github.com/gopalinternship-unibasel/realtime-seismic-analysis">the repository</a>.</p>
+  </footer>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/plotly.js/2.35.3/plotly.min.js" integrity="sha512-7H/XbvOmUsf6mawBvmmx9BsPt9ew2NTwQ3QDSzNe6iyacDbCJU+7pBbZY1NdmTpuj7snxSsXasMYMiR2tv906g==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<!-- The map outlines (topojson). Plotly.js uses them when this file is loaded; without it, it asks cdn.plot.ly. -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/plotly.js/2.35.3/plotly-geo-assets.min.js" integrity="sha512-mLZNEIZStiosrWldyYSftJKTgdMAMWZOOM6PTalqe1f5lSd3Gp8+GT8B8mcNuYe+oFtz8zzd3QW8WIuEC360rg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<script src="app.js"></script>
+</body>
+</html>
