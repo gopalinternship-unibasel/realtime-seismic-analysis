@@ -1,0 +1,135 @@
+name: Live dashboard
+
+# Runs the whole pipeline (Kafka, Spark, PostgreSQL, live USGS feed and replay demo) on a GitHub runner,
+# exports what the dashboard shows as JSON and publishes it with the static page in site/ on GitHub Pages.
+# The page is rewritten every hour; no server stays up in between.
+# One-time setting for the repository owner: Settings > Pages > Build and deployment > Source: GitHub Actions.
+
+on:
+  schedule:
+    - cron: '7 * * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'site/**'
+      - 'src/**'
+      - 'sql/**'
+      - 'data/**'
+      - 'docker-compose.yml'
+      - 'Dockerfile.*'
+      - 'requirements-*.txt'
+      - 'scripts/start.ps1'
+      - '.github/workflows/pages.yml'
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+  actions: write
+
+# Never cancel a deploy that is running; a newer run waits for it.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Run the pipeline, export, publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Start the pipeline with both producers
+        shell: pwsh
+        run: ./scripts/start.ps1 -Mode both -TimeoutSeconds 1800
+
+      # Wait (at most 20 minutes) until: the replay results equal the documented figures (RUNNING.md,
+      # same query as the "stack" job in ci.yml), the live feed has stored events, and no table has
+      # changed its row counts for 60 seconds. Fails when that is not reached.
+      - name: Wait for the results to settle
+        run: |
+          q() { docker compose exec -T postgres psql -U seismic -d seismic -At -c "$1"; }
+          want="184|62|3|34|1|138|0"
+          replay_sql="SELECT (SELECT COUNT(*) FROM seismic_events WHERE source='replay')
+            || '|' || (SELECT COUNT(*) FROM anomaly_windows WHERE source='replay')
+            || '|' || (SELECT COUNT(*) FROM active_regions WHERE source='replay')
+            || '|' || (SELECT COUNT(*) FROM bvalue_windows WHERE source='replay')
+            || '|' || (SELECT COUNT(DISTINCT f.mainshock_id) FROM aftershock_forecasts f JOIN mainshocks m ON m.event_id = f.mainshock_id WHERE m.source='replay')
+            || '|' || COALESCE((SELECT f.aftershock_count FROM aftershock_forecasts f JOIN mainshocks m ON m.event_id = f.mainshock_id WHERE m.source='replay' ORDER BY f.fitted_at DESC, f.id DESC LIMIT 1), 0)
+            || '|' || (SELECT COUNT(*) FROM rejected_records)"
+          live_sql="SELECT COUNT(*) FROM seismic_events WHERE source='usgs-live'"
+          sig_sql="SELECT (SELECT COUNT(*) FROM seismic_events) || '/' || (SELECT COUNT(*) FROM anomaly_windows)
+            || '/' || (SELECT COUNT(*) FROM active_regions) || '/' || (SELECT COUNT(*) FROM bvalue_windows)
+            || '/' || (SELECT COUNT(*) FROM mainshocks) || '/' || (SELECT COUNT(*) FROM aftershock_forecasts)
+            || '/' || (SELECT COUNT(*) FROM rejected_records)"
+          last_sig=""; stable_since=$SECONDS; start=$SECONDS
+          while [ $((SECONDS - start)) -lt 1200 ]; do
+            got="$(q "$replay_sql" 2>/dev/null || true)"
+            live="$(q "$live_sql" 2>/dev/null || echo 0)"
+            sig="$(q "$sig_sql" 2>/dev/null || true)"
+            if [ "$sig" != "$last_sig" ]; then last_sig="$sig"; stable_since=$SECONDS; fi
+            echo "replay $got (want $want) | live events $live | rows $sig | unchanged for $((SECONDS - stable_since)) s"
+            if [ "$got" = "$want" ] && [ "${live:-0}" -gt 0 ] && [ $((SECONDS - stable_since)) -ge 60 ]; then
+              echo "Results are settled."; exit 0
+            fi
+            sleep 10
+          done
+          echo "Not settled after 20 minutes (replay want $want)."
+          exit 1
+
+      - name: Export the dashboard data
+        run: |
+          mkdir -p _export
+          docker compose --profile app run --rm --no-deps --user "$(id -u):$(id -g)" \
+            -e GITHUB_SHA="$GITHUB_SHA" -v "$PWD/_export:/out" \
+            dashboard python -m src.export.export_site --out /out
+          ls -l _export
+
+      - name: Put the page and the data into one folder
+        run: |
+          mkdir -p _site/data
+          cp -r site/. _site/
+          cp _export/*.json _site/data/
+          touch _site/.nojekyll
+          test -s _site/data/meta.json
+          cat _site/data/meta.json; echo
+          du -sh _site
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v6
+
+      - name: Upload the site
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
+
+      - name: Pipeline status
+        if: failure()
+        shell: pwsh
+        run: ./scripts/check.ps1
+
+      - name: Logs of the streaming job on failure
+        if: failure()
+        run: docker compose --profile app --profile replay --profile live logs --tail 150 streaming-job replay-producer live-producer
+
+      - name: Stop
+        if: always()
+        shell: pwsh
+        run: ./scripts/stop.ps1
+
+      # GitHub switches scheduled workflows off after 60 days without repository activity. Enabling
+      # the workflow again through the API keeps the schedule running.
+      - name: Keep the schedule enabled
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/pages.yml/enable"
