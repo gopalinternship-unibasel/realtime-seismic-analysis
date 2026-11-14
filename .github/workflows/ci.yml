@@ -35,3 +35,54 @@ jobs:
       - name: Remove the test database
         if: always()
         run: docker compose --profile test rm -s -f test-postgres
+
+  stack:
+    name: Full stack on the runner (Kafka, Spark, PostgreSQL, replay demo)
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Start the pipeline with the replay demo
+        shell: pwsh
+        run: ./scripts/start.ps1 -Mode replay -TimeoutSeconds 1800
+
+      # The replay demo is deterministic (RUNNING.md, "Replay demo, expected on every fresh
+      # start"): 184 events, 62 anomaly windows, 3 K-Means regions, 34 b-value windows and one
+      # Omori-Utsu forecast, for the M5.6 demo mainshock with 138 aftershocks. Nothing rejected.
+      - name: Replay results in PostgreSQL match the documented figures
+        run: |
+          q() { docker compose exec -T postgres psql -U seismic -d seismic -At -c "$1"; }
+          want="184|62|3|34|1|138|0"
+          sql="SELECT (SELECT COUNT(*) FROM seismic_events WHERE source='replay')
+            || '|' || (SELECT COUNT(*) FROM anomaly_windows WHERE source='replay')
+            || '|' || (SELECT COUNT(*) FROM active_regions WHERE source='replay')
+            || '|' || (SELECT COUNT(*) FROM bvalue_windows WHERE source='replay')
+            || '|' || (SELECT COUNT(DISTINCT f.mainshock_id) FROM aftershock_forecasts f JOIN mainshocks m ON m.event_id = f.mainshock_id WHERE m.source='replay')
+            || '|' || COALESCE((SELECT f.aftershock_count FROM aftershock_forecasts f JOIN mainshocks m ON m.event_id = f.mainshock_id WHERE m.source='replay' ORDER BY f.fitted_at DESC, f.id DESC LIMIT 1), 0)
+            || '|' || (SELECT COUNT(*) FROM rejected_records)"
+          for i in $(seq 1 120); do
+            got="$(q "$sql" 2>/dev/null || true)"
+            echo "events|anomaly windows|regions|b-value windows|forecast mainshocks|aftershocks|rejected = $got"
+            if [ "$got" = "$want" ]; then exit 0; fi
+            sleep 10
+          done
+          echo "expected $want"
+          exit 1
+
+      - name: Dashboard answers
+        run: curl -fsS -o /dev/null -w "dashboard HTTP %{http_code}\n" http://localhost:8050/
+
+      - name: Pipeline status
+        if: always()
+        shell: pwsh
+        run: ./scripts/check.ps1
+
+      - name: Logs of the streaming job on failure
+        if: failure()
+        run: docker compose --profile app --profile replay logs --tail 150 streaming-job replay-producer
+
+      - name: Stop
+        if: always()
+        shell: pwsh
+        run: ./scripts/stop.ps1
