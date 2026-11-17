@@ -190,7 +190,7 @@ Upgrading a stack that ran an older version: `start.ps1` without `-Reset` is eno
 
 ## 12. Live dashboard on GitHub Pages
 
-The public page <https://gopalinternship-unibasel.github.io/realtime-seismic-analysis/> is a static copy of the dashboard, written by the real pipeline. The workflow `.github/workflows/pages.yml` ("Live dashboard") runs on a schedule (every hour at minute 7), on `workflow_dispatch` and on a push to `main` that changes the page, the source, the SQL, the data or the Compose and Docker files. One job on `ubuntu-latest`:
+The public page <https://gopalinternship-unibasel.github.io/realtime-seismic-analysis/> is a static copy of the dashboard, written by the real pipeline. The workflow `.github/workflows/pages.yml` ("Live dashboard") runs on a schedule (every hour at minute 7; GitHub starts scheduled jobs late and skips some when its runners are busy: in the first three days (14 to 17 Nov 2026) the job ran every 4 to 10 hours, and the page states its own age), on `workflow_dispatch` and on a push to `main` that changes the page, the source, the SQL, the data or the Compose and Docker files. One job on `ubuntu-latest`:
 
 1. `scripts/start.ps1 -Mode both -TimeoutSeconds 1800` starts the stack with the live and the replay producer.
 2. It waits at most 20 minutes until the replay results equal the figures in section 4 (the query of the "stack" job in `ci.yml`), the live source has stored events and no table has changed its row counts for 60 seconds. If that is not reached the job fails and nothing is published (the page keeps the last good version).

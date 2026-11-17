@@ -13,7 +13,8 @@
  *   - b-value chart: the oldest 5000 windows of the chosen regions, one line per region and source.
  * Precomputed by the exporter, because they need the full event table: the mainshock list (latest forecast
  * per mainshock), the observed aftershocks per hour, and the points of the fitted curve and the forecast.
- * Not ported: the 10 s auto-refresh. The page shows one run; the workflow rewrites it every hour.
+ * Not ported: the 10 s auto-refresh. The page shows one run; the workflow rewrites it on an hourly
+ * schedule (GitHub starts scheduled jobs late and skips some, so in practice every few hours).
  */
 (function () {
   "use strict";
@@ -572,7 +573,7 @@
     // meta.commit is set by the GitHub Actions run; an export made by hand has none.
     origin.appendChild(document.createTextNode(meta.commit
       ? "This page was written by the pipeline's latest run on GitHub Actions (Kafka, Spark and PostgreSQL started there), at " +
-        fmtSeconds(D.now) + " UTC (" + agoText + "). It is refreshed on a schedule, every hour; it is not a continuously running server. "
+        fmtSeconds(D.now) + " UTC (" + agoText + "). The schedule asks for a new run every hour; GitHub starts scheduled jobs late and skips some, so this copy can be several hours old. It is not a continuously running server. "
       : "This page was written by a local run of the exporter, at " + fmtSeconds(D.now) + " UTC (" + agoText +
         "). It shows that one run; it is not a continuously running server. "));
     if (meta.commit) {

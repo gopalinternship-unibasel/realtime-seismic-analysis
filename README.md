@@ -2,7 +2,7 @@
 
 This is a runnable implementation of the DIS workshop idea from the abstract: a streaming seismic analytics system using the USGS real-time GeoJSON feed, Apache Kafka (KRaft), Spark Structured Streaming on a standalone cluster, PostgreSQL, and a Plotly Dash dashboard, all started with Docker Compose.
 
-**Live dashboard:** <https://gopalinternship-unibasel.github.io/realtime-seismic-analysis/> (a static copy that the real pipeline writes on GitHub Actions every hour; see [Live dashboard](#live-dashboard)).
+**Live dashboard:** <https://gopalinternship-unibasel.github.io/realtime-seismic-analysis/> (a static copy that the real pipeline writes on GitHub Actions on an hourly schedule, in practice every few hours; see [Live dashboard](#live-dashboard)).
 
 For exact start, stop and test commands on Windows see **[RUNNING.md](RUNNING.md)**.
 
@@ -151,7 +151,7 @@ docker compose exec postgres psql -U seismic -d seismic -c "SELECT mainshock_id,
 
 Public page: <https://gopalinternship-unibasel.github.io/realtime-seismic-analysis/>
 
-No free server is large enough to keep Kafka, a Spark cluster, PostgreSQL and the dashboard running all day. So the public page is a static copy. The workflow `.github/workflows/pages.yml` ("Live dashboard") starts the whole pipeline on a GitHub runner every hour (live USGS feed and replay demo), waits until the results are stored, exports what the dashboard shows as JSON (`src/export/export_site.py`) and publishes it with the page in `site/` on GitHub Pages. The page shows the time of that run; it is not a continuously running server. The Dash dashboard on `http://localhost:8050` stays the live version. Details and how to run the exporter by hand are in RUNNING.md, section 12.
+No free server is large enough to keep Kafka, a Spark cluster, PostgreSQL and the dashboard running all day. So the public page is a static copy. The workflow `.github/workflows/pages.yml` ("Live dashboard") starts the whole pipeline on a GitHub runner on an hourly schedule (live USGS feed and replay demo; GitHub starts scheduled jobs late and skips some when its runners are busy: in the first three days (14 to 17 Nov 2026) the job ran every 4 to 10 hours), waits until the results are stored, exports what the dashboard shows as JSON (`src/export/export_site.py`) and publishes it with the page in `site/` on GitHub Pages. The page shows the time of that run; it is not a continuously running server. The Dash dashboard on `http://localhost:8050` stays the live version. Details and how to run the exporter by hand are in RUNNING.md, section 12.
 
 ## Tests
 
