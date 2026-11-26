@@ -222,9 +222,9 @@ def test_forecast_summary_is_wrapping_html_with_the_generic_p_note_and_stale_war
     assert "M5.5 74 km NE of Hasaki, Japan" in text
     # The phrase QA saw clipped as "generic p=1.08 (under 5 afte" is complete.
     assert "p = 1.08 (generic value: fewer than 5 aftershocks)" in text
-    # Five or more aftershocks and still the generic p: the fit's best p lay on the edge of its grid.
+    # Five or more aftershocks and still the generic p: the 95 % interval of p was open at a grid edge or too wide.
     undetermined = text_of(dash_app.forecast_summary(main, {**forecast, "aftershock_count": 5}))
-    assert "p = 1.08 (generic value: the aftershock times do not determine p)" in undetermined
+    assert "p = 1.08 (generic value: the aftershock times do not pin p down closely enough)" in undetermined
     assert "0.08 in the next 6 hours" in text and "after 2026-11-09 03:07 UTC" in text
     assert "Not refitted" not in text and "Inactive" not in text
     # The origin is stored to 4 decimals of an hour: 6.2047 h after 04:47:43 is 10:59:59.9, shown as 11:00.
@@ -373,3 +373,10 @@ def test_regions_wider_than_the_radius_are_marked():
     # Rows from before the flag existed (no columns, or NULL) are not marked.
     old = regions.drop(columns=["radius_limit_km", "max_k", "within_radius"])
     assert "over the" not in text_of(dash_app.regions_table(old))
+
+
+def test_mainshock_heading_does_not_repeat_the_magnitude():
+    # The replay mainshock's place already names its magnitude: "M5.6 Demo M5.6 - ..." was shown.
+    assert dash_app.mainshock_heading({"magnitude": 5.6, "place": "Demo M5.6 - Northern California"}) == "Demo M5.6 - Northern California"
+    assert dash_app.mainshock_heading({"magnitude": 6.8, "place": "105 km NE of Lospalos, Timor Leste"}) == "M6.8 105 km NE of Lospalos, Timor Leste"
+    assert dash_app.mainshock_heading({"magnitude": 5.0, "place": None, "event_id": "us1"}) == "M5.0 us1"

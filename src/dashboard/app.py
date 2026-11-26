@@ -259,6 +259,16 @@ def is_stale(start, clock, active: bool = True) -> bool:
     return (pd.Timestamp(clock) - pd.Timestamp(start)).total_seconds() > STALE_FORECAST_SECONDS
 
 
+def mainshock_heading(mainshock: dict) -> str:
+    """'M6.8 105 km NE of Lospalos, Timor Leste'; no second magnitude when the place already names it
+    (the replay mainshock's place is 'Demo M5.6 - Northern California')."""
+    place = mainshock.get("place")
+    if not isinstance(place, str) or not place:  # None, or NaN from a pandas row
+        place = str(mainshock.get("event_id"))
+    magnitude = f"M{float(mainshock['magnitude']):.1f}"
+    return place if magnitude in place else f"{magnitude} {place}"
+
+
 def forecast_summary(mainshock: dict | None, forecast: dict | None) -> list:
     """The mainshock and the fitted numbers as text above the Omori-Utsu chart.
 
@@ -275,14 +285,14 @@ def forecast_summary(mainshock: dict | None, forecast: dict | None) -> list:
     elif count < MIN_AFTERSHOCKS_FOR_P:
         p_text = f"p = {p:.2f} (generic value: fewer than {MIN_AFTERSHOCKS_FOR_P} aftershocks)"
     else:
-        # seismo_models.fit_omori_utsu: the best p lay on the edge of its search grid.
-        p_text = f"p = {p:.2f} (generic value: the aftershock times do not determine p)"
+        # seismo_models.fit_omori_utsu: the 95 % interval of p reached the edge of its search grid or was wider than 0.6.
+        p_text = f"p = {p:.2f} (generic value: the aftershock times do not pin p down closely enough)"
     start = forecast_start_time(mainshock, forecast)
     start_text = f" after {start:%Y-%m-%d %H:%M} UTC" if start is not None else ""
     lines = [
         html.Div(
             html.Strong(
-                f"M{float(mainshock['magnitude']):.1f} {mainshock.get('place') or mainshock.get('event_id')} · "
+                f"{mainshock_heading(mainshock)} · "
                 f"{pd.Timestamp(mainshock['event_time']):%Y-%m-%d %H:%M} UTC"
             )
         ),
@@ -716,7 +726,8 @@ def pick_mainshock(options: pd.DataFrame, current: str | None) -> tuple[list[dic
 
     opts = [
         {
-            "label": f"M{r.magnitude:.1f} {r.place or r.event_id} · {pd.Timestamp(r.event_time):%Y-%m-%d %H:%M} UTC"
+            "label": f"{mainshock_heading({'magnitude': r.magnitude, 'place': r.place, 'event_id': r.event_id})}"
+            f" · {pd.Timestamp(r.event_time):%Y-%m-%d %H:%M} UTC"
             f" · next 6 h ≈ {r.next_six_hour_expected:.2f}" + status(r),
             "value": r.event_id,
         }

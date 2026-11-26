@@ -2,7 +2,8 @@ name: Live dashboard
 
 # Runs the whole pipeline (Kafka, Spark, PostgreSQL, live USGS feed and replay demo) on a GitHub runner,
 # exports what the dashboard shows as JSON and publishes it with the static page in site/ on GitHub Pages.
-# The page is rewritten on an hourly schedule (GitHub starts scheduled jobs late and skips some);
+# The page is rewritten on an hourly schedule (GitHub starts scheduled jobs late and skips many: from 14 to 26
+# Nov 2026 a run started every 4 to 12 hours, and a failed run can leave the page up to about a day old);
 # no server stays up in between.
 # One-time setting for the repository owner: Settings > Pages > Build and deployment > Source: GitHub Actions.
 

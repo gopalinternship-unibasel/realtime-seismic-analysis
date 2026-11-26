@@ -95,7 +95,10 @@ def test_quiet_time_after_the_last_aftershock_lowers_the_forecast():
     fit = fit_omori_utsu(hours, forecast_from_hours=124, observed_until_hours=124)
     assert fit is not None
     # The old least-squares fit on non-empty hourly bins gave p=0 and 6 aftershocks in 6 hours here.
-    assert fit.p_value > 0.3
+    # Five aftershocks leave p open (95 % interval 0.30 to 1.61), so K is fitted with the generic p;
+    # the quiet days still count, through the observed time of 124 hours.
+    assert not fit.p_estimated and fit.p_value == 1.08
+    assert abs(fit.k_value - 5 / omori_integral(0.05, 1.08, 0.0, 124 / 24.0)) < 1e-3
     assert fit.next_six_hour_expected < 0.5
 
 
@@ -106,16 +109,39 @@ def test_short_sequences_use_the_generic_p():
     assert short.p_value == 1.08
     # The old fit returned p=0, R²=1 and 6 expected aftershocks in 6 hours for this sequence.
     assert short.next_six_hour_expected < 0.2
-    # Five aftershocks that thin out over time: p is fitted.
+    # Five aftershocks that thin out over time still leave p open (95 % interval 0.30 to 1.97).
     decaying = fit_omori_utsu([0.5, 1.5, 4.0, 10.0, 30.0])
-    assert decaying.p_estimated and 0.3 < decaying.p_value < 2.5
+    assert not decaying.p_estimated and decaying.p_value == 1.08
+    # 43 aftershocks of a p = 1.1 sequence pin p down (interval 0.97 to 1.38, 0.41 wide): it is fitted.
+    longer_hours = synthetic_aftershock_hours(k=10.0, c=0.05, p=1.1, days=7)
+    longer = fit_omori_utsu(longer_hours, observed_until_hours=7 * 24)
+    assert len(longer_hours) == 43
+    assert longer.p_estimated and abs(longer.p_value - 1.1) < 0.2
 
 
-def test_a_p_on_the_edge_of_the_grid_falls_back_to_the_generic_p():
-    # The M6.8 off Timor-Leste of 24 Nov 2026: 5 aftershocks, best p on the grid's lower edge (0.30),
-    # shown as "p = 0.30 (fitted)" with a 6-hour forecast four times the one of the generic p.
-    timor = fit_omori_utsu([6.23, 43.56, 45.09, 45.9, 65.5])
-    assert not timor.p_estimated and timor.p_value == 1.08
+def test_p_falls_back_to_the_generic_p_when_its_95_percent_interval_is_too_wide():
+    # 10 aftershocks of a p = 1.1 sequence: the interval 0.81 to 1.72 lies inside the grid but is
+    # 0.91 wide, more than P_MAX_INTERVAL_WIDTH (0.6).
+    hours = synthetic_aftershock_hours(k=3.0, c=0.05, p=1.1, days=7)
+    fit = fit_omori_utsu(hours, observed_until_hours=7 * 24)
+    assert len(hours) == 10
+    assert not fit.p_estimated and fit.p_value == 1.08
+
+
+def test_p_falls_back_to_the_generic_p_when_its_95_percent_interval_reaches_the_grid_edge():
+    # The M6.8 off Timor-Leste of 21 Nov 2026: 5 aftershocks. On 25 Nov (observed for 108.59 hours) its
+    # best p was 0.30, the grid's lower edge (interval 0.30 to 1.00); on 26 Nov (121.02 hours) it was
+    # 0.32 and shown as "fitted", although its 95 % interval ran from 0.30 to 1.05. Both must use the
+    # generic p; only the 26 Nov case failed under the rule of commit a57f641.
+    timor_hours = [6.23, 43.56, 45.09, 45.9, 65.5]
+    timor_25_nov = fit_omori_utsu(timor_hours, forecast_from_hours=108.59, observed_until_hours=108.59)
+    assert not timor_25_nov.p_estimated and timor_25_nov.p_value == 1.08
+    timor_26_nov = fit_omori_utsu(timor_hours, forecast_from_hours=121.02, observed_until_hours=121.02)
+    assert not timor_26_nov.p_estimated and timor_26_nov.p_value == 1.08
+    timor = fit_omori_utsu(timor_hours)
+    # All aftershocks within minutes, then a quiet week: the interval reaches the upper edge.
+    burst = fit_omori_utsu([0.05, 0.1, 0.15, 0.2, 0.25], observed_until_hours=7 * 24)
+    assert not burst.p_estimated and burst.p_value == 1.08
     # A steady rate (no decay at all) cannot fix p either.
     steady = fit_omori_utsu([1.0, 2.0, 3.0, 4.0, 5.0])
     assert not steady.p_estimated and steady.p_value == 1.08

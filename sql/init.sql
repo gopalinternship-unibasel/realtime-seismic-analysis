@@ -162,7 +162,8 @@ CREATE TABLE IF NOT EXISTS aftershock_forecasts (
     r_squared DOUBLE PRECISION,
     -- Hours after the mainshock at which the forecast starts (the source's data clock).
     forecast_origin_hours DOUBLE PRECISION,
-    -- FALSE when the sequence was too short to fit p and the generic p was used.
+    -- FALSE when the generic p was used: fewer than 5 aftershocks, or a 95 % interval of p that reaches
+    -- the edge of the search grid (0.3 to 2.5) or is wider than 0.6 (seismo_models.fit_omori_utsu).
     p_estimated BOOLEAN NOT NULL DEFAULT TRUE,
     UNIQUE (batch_id, mainshock_id)
 );

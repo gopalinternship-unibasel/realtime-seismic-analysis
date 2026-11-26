@@ -14,7 +14,8 @@
  * Precomputed by the exporter, because they need the full event table: the mainshock list (latest forecast
  * per mainshock), the observed aftershocks per hour, and the points of the fitted curve and the forecast.
  * Not ported: the 10 s auto-refresh. The page shows one run; the workflow rewrites it on an hourly
- * schedule (GitHub starts scheduled jobs late and skips some, so in practice every few hours).
+ * schedule (GitHub starts scheduled jobs late and skips many: from 14 to 26 Nov 2026 a run started every 4 to 12
+ * hours, and a failed run can leave the copy up to about a day old).
  * One rule differs from Dash: the sliding windows the export holds include ones that were still open when
  * the data was written (they end after the newest event of their source, up to half a day later, and hold
  * only part of their data). A running Dash page fills them as data arrives; this one-run copy leaves them
@@ -416,7 +417,8 @@
     }
     if (regions.length) {
       traces.push({
-        type: "scattergeo", mode: "markers+text", name: "K-Means active regions", hoverinfo: "text",
+        // On phones the labels crowd over the western US and the colour bar cuts them: hover only there.
+        type: "scattergeo", mode: phone ? "markers" : "markers+text", name: "K-Means active regions", hoverinfo: "text",
         textposition: "top center",
         lon: regions.map(function (r) { return r.centroid_lon; }),
         lat: regions.map(function (r) { return r.centroid_lat; }),
@@ -440,7 +442,8 @@
   }
 
   function drawBvalues(rows) {
-    var t = theme(), traces = [], layout = baseLayout(380);
+    var phone = window.innerWidth <= 640;
+    var t = theme(), traces = [], layout = baseLayout(0);
     var chosen = {};
     state.regions.forEach(function (r) { chosen[r] = true; });
     var selected = rows.filter(function (b) { return chosen[b.region_id]; });
@@ -457,7 +460,9 @@
       });
       var alertLegendShown = false;
       Object.keys(groups).sort().forEach(function (key) {
-        var g = groups[key], name = multiSource ? g[0].region_id + " (" + sourceLabel(g[0].source) + ")" : String(g[0].region_id);
+        // Short legend names ("live" / "demo", the words of the region table's "Live R1" / "Demo R1") keep the legend
+        // small; the Dash page writes the source out ("R-130_+30 (Replay demo)").
+        var g = groups[key], name = multiSource ? g[0].region_id + (g[0].source === "replay" ? " · demo" : " · live") : String(g[0].region_id);
         // A window is stored only with 20 or more events above Mc, so hours without one are gaps: a null point
         // breaks the line there instead of drawing a straight line across a day without an estimate.
         var x = [], y = [], sigma = [], custom = [];
@@ -477,24 +482,38 @@
         var alerts = g.filter(function (b) { return b.is_alert; });
         if (alerts.length) {
           traces.push({
-            type: "scatter", mode: "markers", name: "b-value alert: |b − long-term b| > max(0.25, 2σ)",
-            legendgroup: "alerts", showlegend: !alertLegendShown,
+            // The rule is in the note under the chart and in the hover text; the legend keeps the short name.
+            type: "scatter", mode: "markers", name: "b-value alert",
+            legendgroup: "alerts", showlegend: !alertLegendShown, legendrank: 2000,
             x: alerts.map(function (b) { return plotTime(b.window_end_ms); }),
             y: alerts.map(function (b) { return b.b_value; }),
             marker: { color: "#dc2626", size: 11, symbol: "circle-open", line: { width: 2 } },
-            hovertemplate: "b-value alert<br>b=%{y:.2f}<extra>" + name + "</extra>",
+            hovertemplate: "b-value alert: |b − long-term b| > max(0.25, 2σ)<br>b=%{y:.2f}<extra>" + name + "</extra>",
           });
           alertLegendShown = true;
         }
       });
     } else {
-      layout.annotations = [{ text: "No b-value windows for this selection yet", showarrow: false, x: 0.5, y: 0.5,
-        xref: "paper", yref: "paper" }];
+      // "Choose" only when the visitor cleared the list; with no windows in the time range there is nothing to choose.
+      var cleared = !state.regions.length && regionOptions().length > 0;
+      layout.annotations = [{ text: cleared ? "Choose one or more regions above" : "No b-value windows for this selection yet",
+        showarrow: false, x: 0.5, y: 0.5, xref: "paper", yref: "paper" }];
     }
     layout.xaxis = { title: { text: "Window end (UTC)" }, gridcolor: t.grid };
     layout.yaxis = { title: { text: "b-value" }, gridcolor: t.grid };
-    layout.margin = { r: 20, t: 20, l: 50, b: 40 };
-    layout.legend = { orientation: "h", y: -0.25 };
+    // The legend starts 66 px (phones: 76 px) below the plot area, under the date labels (two lines) and the
+    // axis title, and the bottom margin grows with its rows: phones show one entry per row, wider screens two to
+    // three (two are assumed). The chart's height follows, so the plot area keeps its size. A legend at
+    // y = -0.25 of a fixed 380 px chart overlapped the axis title, and on phones Plotly squeezed the plot to fit
+    // it. legendrank lists the alert entry last.
+    var entries = traces.filter(function (tr) { return tr.showlegend !== false; }).length;
+    var rows = phone ? entries : Math.ceil(entries / 2);
+    var top = 20, plotHeight = phone ? 330 : 300, offset = phone ? 76 : 66;
+    var bottom = offset + rows * (phone ? 30 : 24) + 10;
+    layout.height = top + plotHeight + bottom;
+    $("bvalue-chart").style.height = layout.height + "px";
+    layout.margin = { r: 20, t: top, l: 50, b: bottom };
+    layout.legend = { orientation: "h", x: 0, xanchor: "left", y: -offset / plotHeight, yanchor: "top" };
     // Plotly's default colours start with red, the colour of the alert circles: the region lines leave it out.
     layout.colorway = ["#1f77b4", "#2ca02c", "#9467bd", "#ff7f0e", "#8c564b", "#e377c2", "#17becf", "#bcbd22", "#7f7f7f"];
     draw("bvalue-chart", traces, layout);
@@ -516,10 +535,11 @@
       ? "p = " + fixed(f.p, 2) + " (fitted), R² = " + (isNum(f.r_squared) ? fixed(f.r_squared, 2) : "n/a")
       : f.aftershocks < info.min_aftershocks_for_p
         ? "p = " + fixed(f.p, 2) + " (generic value: fewer than " + info.min_aftershocks_for_p + " aftershocks)"
-        // seismo_models.fit_omori_utsu: the best p lay on the edge of its search grid.
-        : "p = " + fixed(f.p, 2) + " (generic value: the aftershock times do not determine p)";
+        // seismo_models.fit_omori_utsu: the 95 % interval of p reached the edge of its search grid or was wider than 0.6.
+        : "p = " + fixed(f.p, 2) + " (generic value: the aftershock times do not pin p down closely enough)";
     var startText = f.start_ms !== null && f.start_ms !== undefined ? " after " + fmtMinutes(f.start_ms) + " UTC" : "";
-    box.appendChild(el("div", {}, [el("strong", { text: "M" + fixed(m.mag, 1) + " " + (m.place || m.id) + " · " + fmtMinutes(m.time_ms) + " UTC" })]));
+    var place = m.place || m.id, magText = "M" + fixed(m.mag, 1);
+    box.appendChild(el("div", {}, [el("strong", { text: (place.indexOf(magText) >= 0 ? "" : magText + " ") + place + " · " + fmtMinutes(m.time_ms) + " UTC" })]));
     box.appendChild(el("div", { text: f.aftershocks + " aftershocks within " + Math.round(info.radius_km) + " km and " + info.window_days +
       " days · K = " + fixed(f.k, 1) + "/day, c = " + fixed(f.c, 2) + " d, " + pText }));
     // The aftershocks are all smaller events in the catalogue around the mainshock, so the expected number
@@ -588,11 +608,11 @@
     [
       ["Events", thousands(events.length), "metric-events"],
       ["Anomalous cells", cells.length, "metric-anomalous-cells"],
-      ["Active regions (K-Means)", regions.length, "metric-active-regions"],
+      ["Active regions (K‑Means)", regions.length, "metric-active-regions"],
       ["b-value windows", thousands(bw.length), "metric-bvalue-windows"],
       // Windows slide by 1 hour, so one change in b raises several alert windows in a row.
       ["b-value alert windows", alerts, "metric-bvalue-alerts"],
-      ["Active mainshocks (M ≥ 5)", active, "metric-mainshocks", forecasts + " with a forecast"],
+      ["Active mainshocks (M ≥ 5)", active, "metric-mainshocks", forecasts + " with a forecast"],
     ].forEach(function (c) { box.appendChild(metricCard(c[0], c[1], c[2], c[3])); });
   }
 
@@ -646,7 +666,7 @@
     // meta.commit is set by the GitHub Actions run; an export made by hand has none.
     origin.appendChild(document.createTextNode(meta.commit
       ? "This page was written by the pipeline's latest run on GitHub Actions (Kafka, Spark and PostgreSQL started there), at " +
-        fmtSeconds(D.now) + " UTC (" + agoText + "). The schedule asks for a new run every hour, but GitHub starts scheduled jobs late and skips many: a new copy usually comes every few hours and can take up to about a day. It is not a continuously running server. "
+        fmtSeconds(D.now) + " UTC (" + agoText + "). The schedule asks for a new run every hour, but GitHub starts scheduled jobs late and skips many: a new copy usually comes every 4 to 12 hours and can take up to about a day. It is not a continuously running server. "
       : "This page was written by a local run of the exporter, at " + fmtSeconds(D.now) + " UTC (" + agoText +
         "). It shows that one run; it is not a continuously running server. "));
     if (meta.commit) {
@@ -733,7 +753,8 @@
     var resizeTimer = null;
     window.addEventListener("resize", function () {
       clearTimeout(resizeTimer);
-      resizeTimer = setTimeout(function () { if (D) { drawMap(eventsInView(), anomalousCells(), activeRegions()); } }, 200);
+      // Both charts change their layout at the 640 px phone width (map labels, b-value chart height and legend).
+      resizeTimer = setTimeout(function () { if (D) { drawMap(eventsInView(), anomalousCells(), activeRegions()); drawBvalues(bvalueWindows()); } }, 200);
     });
     if (!window.Plotly) {
       var err = $("load-error");

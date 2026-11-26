@@ -15,10 +15,20 @@ AFTERSHOCK_WINDOW_DAYS = 7
 MIN_AFTERSHOCKS = 3
 MIN_AFTERSHOCKS_FOR_P = 5
 GENERIC_P = 1.08
-# The grid p is searched on. A best p on its edge means the likelihood still rises there: the
-# aftershock times do not pin p down, and the generic p is used instead.
+# The grid p is searched on. The fitted p is used only when its 95 % profile-likelihood interval
+# (every p whose log-likelihood is within P_PROFILE_DROP of the best) lies inside the grid and is
+# at most P_MAX_INTERVAL_WIDTH wide; otherwise the aftershock times do not pin p down closely
+# enough, and the generic p is used instead.
 P_GRID_MIN = 0.30
 P_GRID_MAX = 2.50
+# Half the 95 % quantile of the chi-square distribution with one degree of freedom (3.84 / 2).
+P_PROFILE_DROP = 1.92
+# A design choice: p known to about +-0.3. In synthetic sequences drawn from the model (p 0.9 to
+# 1.4, c = 0.05 d) and observed for 7 days, the median interval width was 1.2 to 1.3 for 5
+# aftershocks (clipped at the grid edges), 0.9 to 1.0 for 10, 0.6 to 0.7 for 20, 0.5 to 0.55 for
+# 30 and 0.4 for 50; 0 to 2 % of the 20-aftershock sequences and about 90 to 100 % of the
+# 30-aftershock ones passed.
+P_MAX_INTERVAL_WIDTH = 0.6
 
 
 def _bin_index(values: np.ndarray, bin_width: float) -> np.ndarray:
@@ -207,9 +217,16 @@ def fit_omori_utsu(
     (Ogata 1983, with c held fixed). Quiet time after the last aftershock therefore lowers
     the forecast, unlike a least-squares fit to the non-empty hourly bins only. Sequences
     with fewer than MIN_AFTERSHOCKS_FOR_P aftershocks keep p at GENERIC_P and fit K only, and
-    so does a sequence whose best p lies on the edge of the grid: the data do not determine
-    p then (the M6.8 off Timor-Leste on 24 Nov 2026 gave p = 0.30 from 5 aftershocks 84 to 266
-    km away, which quadrupled its 6-hour forecast against the generic p).
+    so does a sequence whose 95 % profile-likelihood interval of p reaches an edge of the grid
+    or is wider than P_MAX_INTERVAL_WIDTH: the data do not pin p down closely enough then. The
+    M6.8 off Timor-Leste of 21 Nov 2026 had 5 aftershocks; its best p was 0.30 on 25 Nov
+    (interval 0.30 to 1.00) and 0.32 on 26 Nov (interval 0.30 to 1.05), so a test of the best p
+    alone against the grid edge missed it on 26 Nov. When the interval reaches an edge the
+    generic p can lie outside it (all aftershocks within minutes, then a quiet week, gives an
+    interval of 1.96 to the upper edge): such a sequence still gets the generic p, because no p
+    inside the grid is pinned down. The grid edge also catches a p that is well determined but
+    within about 0.1 of 0.30 or 0.1 to 0.2 of 2.50 (seen in simulation with 200 to 500
+    aftershocks); how often real sequences have such a p was not checked.
 
     The forecast is the expected number of aftershocks in the hour and the six hours
     after ``forecast_from_hours`` (the time the forecast is made, e.g. "now"); it never
@@ -225,24 +242,33 @@ def fit_omori_utsu(
     t_end = t_end_hours / 24.0
     sum_log = float(np.sum(np.log(t_days + c_days)))
 
-    p_estimated = n >= MIN_AFTERSHOCKS_FOR_P
-    best = None
-    def best_fit(p_values):
-        found = None
+    def scores(p_values):
+        """(log-likelihood, p, K) for each p, with K at its maximum-likelihood value for that p."""
+        found = []
         for p_value in p_values:
             integral = omori_integral(c_days, float(p_value), 0.0, t_end)
             if integral <= 0:
                 continue
             k_value = n / integral
             log_likelihood = n * math.log(k_value) - float(p_value) * sum_log - n
-            if found is None or log_likelihood > found[0]:
-                found = (log_likelihood, float(p_value), k_value)
+            found.append((log_likelihood, float(p_value), k_value))
         return found
 
-    best = best_fit(np.round(np.arange(P_GRID_MIN, P_GRID_MAX + 0.0001, 0.01), 2) if p_estimated else [GENERIC_P])
-    if best is not None and p_estimated and best[1] in (P_GRID_MIN, P_GRID_MAX):
-        p_estimated = False
-        best = best_fit([GENERIC_P])
+    p_estimated = n >= MIN_AFTERSHOCKS_FOR_P
+    best = None
+    if p_estimated:
+        scored = scores(np.round(np.arange(P_GRID_MIN, P_GRID_MAX + 0.0001, 0.01), 2))
+        if scored:
+            best = max(scored, key=lambda s: s[0])
+            plausible = [p for log_likelihood, p, _k in scored if best[0] - log_likelihood <= P_PROFILE_DROP]
+            low, high = min(plausible), max(plausible)
+            if low <= P_GRID_MIN + 1e-9 or high >= P_GRID_MAX - 1e-9 or high - low > P_MAX_INTERVAL_WIDTH + 1e-9:
+                p_estimated = False
+        else:
+            p_estimated = False
+    if not p_estimated:
+        generic = scores([GENERIC_P])
+        best = generic[0] if generic else None
     if best is None:
         return None
     _ll, p_value, k_value = best

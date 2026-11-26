@@ -206,6 +206,17 @@ input[type="range"] {
   height: 380px;
 }
 
+/* Height before the first draw; drawBvalues sets the height from the number of legend rows. */
+#bvalue-chart {
+  height: 440px;
+}
+
+.chart-note {
+  color: var(--muted);
+  font-size: 13px;
+  margin: 4px 0 0 0;
+}
+
 .forecast-summary {
   color: var(--text-2);
   font-size: 14px;
@@ -342,5 +353,8 @@ footer {
   }
   .map-plot {
     height: 380px;
+  }
+  #bvalue-chart {
+    height: 520px;
   }
 }
