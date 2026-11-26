@@ -255,3 +255,14 @@ def test_command_line_writes_into_the_folder(engine, tmp_path, monkeypatch, caps
     assert export_site.main(["--out", str(tmp_path / "data"), "--max-events", "5"]) == 0
     assert (tmp_path / "data" / "meta.json").exists()
     assert "events.json" in capsys.readouterr().out
+
+
+def test_small_forecast_rates_keep_two_significant_figures():
+    """The page shows two significant figures below 0.1, so the exporter must not round them to 3 decimals (no database needed)."""
+    main = {"event_time": T0}
+    forecast = {"aftershock_count": 4, "k_value": 1.0, "c_value": 0.05, "p_value": 1.1, "p_estimated": True,
+                "r_squared": 0.5, "next_hour_rate": 0.0043217, "next_six_hour_expected": 0.000123456,
+                "forecast_origin_hours": 10.0}
+    entry = export_site.forecast_entry(main, forecast, [0.5, 1.5])
+    assert entry["next_hour"] == 0.004322
+    assert entry["next_six_hours"] == 0.000123

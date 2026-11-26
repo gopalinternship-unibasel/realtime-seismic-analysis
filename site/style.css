@@ -357,4 +357,9 @@ footer {
   #bvalue-chart {
     height: 520px;
   }
+  #regions-table th,
+  #regions-table td {
+    padding-right: 8px;
+    font-size: 13px;
+  }
 }

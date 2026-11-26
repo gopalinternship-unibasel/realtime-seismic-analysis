@@ -77,7 +77,9 @@
     var v = Number(value);
     if (!isFinite(v) || v <= 0 || v >= 0.1) { return fixed(v, 2); }
     if (v < 0.0001) { return "less than 0.0001"; }
-    return String(Number(v.toFixed(1 - Math.floor(Math.log10(v)))));
+    var shown = Number(v.toFixed(1 - Math.floor(Math.log10(v))));
+    // 0.0995 rounds up to 0.1: keep the two-decimal form of the larger values.
+    return shown >= 0.1 ? fixed(shown, 2) : String(shown);
   }
 
   /* "R-130_+30" is the 10 x 10 degree box from 130 W to 120 W and 30 N to 40 N. */
@@ -85,9 +87,17 @@
     var m = /^R([+-]?\d+)_([+-]?\d+)$/.exec(String(regionId));
     if (!m) { return String(regionId); }
     var lon = parseInt(m[1], 10), lat = parseInt(m[2], 10);
-    var lonText = lon < 0 ? Math.abs(lon) + "-" + Math.abs(lon + 10) + "\u00b0W" : lon + "-" + (lon + 10) + "\u00b0E";
-    var latText = lat < 0 ? Math.abs(lat) + "-" + Math.abs(lat + 10) + "\u00b0S" : lat + "-" + (lat + 10) + "\u00b0N";
-    return lonText + ", " + latText;
+    return edgeText(lon, "W", "E", 180) + ", " + edgeText(lat, "S", "N", 90);
+  }
+
+  /* One 10 degree interval from "start": "130-120\u00b0W", "10\u00b0W-0\u00b0", "0-10\u00b0E", capped at the pole or the date line. */
+  function edgeText(start, neg, pos, cap) {
+    var a = start, b = Math.min(start + 10, cap);
+    if (a >= cap) { a = cap - 10; b = cap; }
+    if (a < 0) {
+      return b === 0 ? Math.abs(a) + "\u00b0" + neg + "-0\u00b0" : Math.abs(a) + "-" + Math.abs(b) + "\u00b0" + neg;
+    }
+    return a + "-" + b + "\u00b0" + pos;
   }
 
   function selectedSources() {
@@ -189,7 +199,8 @@
         regions: rowsToObjects(v[3], []),
         bvalues: bvalues,
         // Windows that were still open when the data was written: stored, but left out of the page.
-        openWindows: (allWindows.length - windows.length) + (allBvalues.length - bvalues.length),
+        openAnomalyWindows: allWindows.length - windows.length,
+        openBvalueWindows: allBvalues.length - bvalues.length,
         mainshocks: mainshocks,
         status: v[6],
       };
@@ -389,6 +400,36 @@
 
   function clusterColor(id) { return CLUSTER_COLORS[Math.abs(Math.round(id)) % CLUSTER_COLORS.length]; }
 
+  /* Text-only labels. They go to the regions with the highest max z first. A region gets none when it lies within
+     the label distance of another region's centroid (its text would sit on that region's markers) or of a region
+     already labelled. Every marker keeps its hover text. */
+  function regionLabelTrace(regions, multiSource, t) {
+    var labelled = [], labels = regions.map(function () { return ""; });
+    var close = function (r, o) {
+      var dlon = Math.abs(r.centroid_lon - o.centroid_lon);
+      if (dlon > 180) { dlon = 360 - dlon; }
+      // A label is wider than tall: about 8 degrees apart in latitude, twice that in longitude.
+      return dlon < 2 * LABEL_MIN_DISTANCE_DEG && Math.abs(r.centroid_lat - o.centroid_lat) < LABEL_MIN_DISTANCE_DEG;
+    };
+    var zOf = function (r) { return isNum(r.max_z_score) ? r.max_z_score : -Infinity; };
+    regions.map(function (r, i) { return i; }).sort(function (a, b) {
+      var za = zOf(regions[a]), zb = zOf(regions[b]);
+      return (za === zb ? 0 : zb - za) || 0;
+    }).forEach(function (i) {
+      var r = regions[i];
+      var covers = regions.some(function (o, j) { return j !== i && close(r, o); });
+      if (!covers) { labelled.push(r); labels[i] = regionName(r, multiSource); }
+    });
+    if (!labelled.length) { return null; }
+    return {
+      type: "scattergeo", mode: "text", name: "Region labels", hoverinfo: "skip", showlegend: false,
+      textposition: "top center", textfont: { color: t.text, size: 12 },
+      lon: regions.map(function (r) { return r.centroid_lon; }),
+      lat: regions.map(function (r) { return r.centroid_lat; }),
+      text: labels,
+    };
+  }
+
   function drawMap(events, cells, regions) {
     var t = theme(), traces = [], phone = isPhone();
     var shown = events.slice(0, MAP_EVENT_LIMIT);
@@ -446,39 +487,23 @@
         },
       });
     }
+    var labelTrace = null;
     if (regions.length) {
-      // Labels go to the regions with the highest max z first, and a region within about 8 degrees of one already
-      // labelled gets none, so they do not print over each other. Every marker keeps its hover text.
-      var labelled = [], labels = regions.map(function () { return ""; });
-      regions.map(function (r, i) { return i; }).sort(function (a, b) {
-        var za = isNum(regions[a].max_z_score) ? regions[a].max_z_score : -Infinity;
-        var zb = isNum(regions[b].max_z_score) ? regions[b].max_z_score : -Infinity;
-        return zb - za;
-      }).forEach(function (i) {
-        var r = regions[i];
-        var near = labelled.some(function (o) {
-          var dlon = Math.abs(r.centroid_lon - o.centroid_lon);
-          if (dlon > 180) { dlon = 360 - dlon; }
-          // A label is wider than tall: about 8 degrees apart in latitude, twice that in longitude.
-          return dlon < 2 * LABEL_MIN_DISTANCE_DEG && Math.abs(r.centroid_lat - o.centroid_lat) < LABEL_MIN_DISTANCE_DEG;
-        });
-        if (!near) { labelled.push(r); labels[i] = regionName(r, multiSource); }
-      });
       traces.push({
-        // On phones the labels crowd over the western US and the colour bar cuts them: hover only there.
-        type: "scattergeo", mode: phone ? "markers" : "markers+text", name: "K-Means active regions", hoverinfo: "text",
-        textposition: "top center",
+        type: "scattergeo", mode: "markers", name: "K-Means active regions", hoverinfo: "text",
         lon: regions.map(function (r) { return r.centroid_lon; }),
         lat: regions.map(function (r) { return r.centroid_lat; }),
-        text: labels,
         hovertext: regions.map(function (r) {
           return "Active region " + regionName(r, multiSource) + " (" + sourceLabel(r.source) + ")<br>" +
             (r.cell_count === 1 ? "1 cell" : r.cell_count + " cells, radius " + radiusText(r)) + "<br>max z=" + fixed(r.max_z_score, 2);
         }),
         marker: { size: 14, symbol: "x", color: regions.map(function (r) { return clusterColor(r.cluster_id); }) },
-        textfont: { color: t.text },
       });
+      // On phones the labels crowd over the western US and the colour bar cuts them: hover only there.
+      if (!phone) { labelTrace = regionLabelTrace(regions, multiSource, t); }
     }
+    // The region labels are a trace of their own, added after every marker trace, so the text is drawn on top of the cell squares.
+    if (labelTrace) { traces.push(labelTrace); }
     var layout = baseLayout(phone ? 380 : 520);
     layout.margin = { r: 0, t: 20, l: 0, b: 0 };
     layout.legend = phone ? { orientation: "h", y: -0.02, font: { size: 10 } } : { orientation: "h" };
@@ -693,12 +718,14 @@
     }
     // The regions are built from the last 24 hours of data, whatever the time range above.
     var head = ["Region", "Source", "Centroid (lon, lat)", "Cells", "Radius", "Max z (last 24 h)", "Max 6 h count (last 24 h)", "Cell ids"];
+    // On phones the headings are short (the hover of the map and the note above say "last 24 h") so the table fits its card.
+    var phoneHead = ["Region", "Centroid", "Cells", "Radius", "Max z", "Max 6 h"];
     var multiSource = selectedSources().length > 1;
     // On phones the Source and Cell ids columns go: the region name already says Live or Demo.
     var phone = isPhone();
     var keep = function (cells) { return phone ? cells.filter(function (_, i) { return i !== 1 && i !== 7; }) : cells; };
     var table = el("table", { id: "regions-table-content" }, [
-      el("thead", {}, [el("tr", {}, keep(head).map(function (h) { return el("th", { text: h }); }))]),
+      el("thead", {}, [el("tr", {}, (phone ? phoneHead : head).map(function (h) { return el("th", { text: h }); }))]),
       el("tbody", {}, regions.map(function (r) {
         return el("tr", {}, keep([
           el("td", { text: regionName(r, multiSource) }),
@@ -731,10 +758,10 @@
       origin.appendChild(document.createTextNode("Code version: "));
       origin.appendChild(el("a", { href: REPO_URL + "/commit/" + meta.commit, text: meta.commit.slice(0, 7) }));
       origin.appendChild(document.createTextNode(". "));
-      // The Actions run that wrote this page: its log shows Kafka, Spark and PostgreSQL running.
+      // The Actions run that wrote this page. GitHub shows the run's log only to signed-in visitors, so the link says so.
       if (typeof meta.run_url === "string" && meta.run_url.indexOf("https://github.com/") === 0) {
-        origin.appendChild(el("a", { href: meta.run_url, text: "Pipeline run log" }));
-        origin.appendChild(document.createTextNode(". "));
+        origin.appendChild(el("a", { href: meta.run_url, text: "Pipeline run on GitHub Actions" }));
+        origin.appendChild(document.createTextNode(" (the log needs a GitHub sign-in). "));
       }
     }
     origin.appendChild(el("a", { href: REPO_URL, text: "Repository" }));
@@ -778,14 +805,15 @@
     drawStatusNote();
   }
 
-  /* Why the status counts are higher than the cards above: they count every stored row. */
+  /* Why the table counts differ from the cards above: the table counts the whole latest run, the cards a selection. */
   function drawStatusNote() {
     var note = $("status-note"), declustered = D.mainshocks.declustered_counts, m = 0;
     if (!declustered) { note.textContent = ""; return; }
     Object.keys(declustered).forEach(function (src) { m += declustered[src]; });
-    note.textContent = "Why the status counts are higher than the cards above: " + thousands(D.openWindows) +
-      " windows were still open when the data was written (left out of the charts) and " + thousands(m) +
-      " events of M \u2265 5 belong to a larger event's sequence (declustered, no forecast of their own).";
+    note.textContent = "The table counts the whole latest run: both sources and all 7 days. The cards above count only the selected sources and time range, " +
+      "and they leave out " + thousands(D.openBvalueWindows) + " b-value windows and " + thousands(D.openAnomalyWindows) +
+      " anomaly windows that were still open when the data was written, and " + thousands(m) +
+      " events of M \u2265 5 that belong to a larger event's sequence (declustered, no forecast of their own).";
   }
 
   function render() {
@@ -824,11 +852,17 @@
       if (query.addEventListener) { query.addEventListener("change", rerender); }
       else if (query.addListener) { query.addListener(rerender); }
     }
-    var resizeTimer = null;
+    var resizeTimer = null, wasPhone = isPhone();
     window.addEventListener("resize", function () {
       clearTimeout(resizeTimer);
       // The page changes its layout at the 640 px phone width (map labels and colour bar, b-value chart, toolbars, regions table).
-      resizeTimer = setTimeout(function () { if (D) { drawMap(eventsInView(), anomalousCells(), activeRegions()); drawBvalues(bvalueWindows()); drawRegionsTable(activeRegions()); drawForecast(currentMainshock()); } }, 200);
+      // Redraw only when that width is crossed: a phone also fires resize when its address bar moves, and a redraw would reset the table scroll and the chart zoom.
+      resizeTimer = setTimeout(function () {
+        var phone = isPhone();
+        if (phone === wasPhone) { return; }
+        wasPhone = phone;
+        if (D) { drawMap(eventsInView(), anomalousCells(), activeRegions()); drawBvalues(bvalueWindows()); drawRegionsTable(activeRegions()); drawForecast(currentMainshock()); }
+      }, 200);
     });
     if (!window.Plotly) {
       var err = $("load-error");

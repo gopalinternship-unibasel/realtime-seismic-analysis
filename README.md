@@ -1,6 +1,6 @@
 # Real-Time Seismic Activity Analysis and Aftershock Forecasting with Apache Spark and Kafka
 
-A streaming seismic analytics system that implements the workshop abstract mapped requirement by requirement in the table near the end of this file. It uses the USGS real-time GeoJSON feed, Apache Kafka (KRaft), Spark Structured Streaming on a standalone cluster, PostgreSQL, and a Plotly Dash dashboard, all started with Docker Compose.
+A streaming seismic analytics system built for a workshop abstract; the table [How the pipeline maps to the workshop abstract](#how-the-pipeline-maps-to-the-workshop-abstract) lists each requirement and the code that meets it. It uses the USGS real-time GeoJSON feed, Apache Kafka (KRaft), Spark Structured Streaming on a standalone cluster, PostgreSQL, and a Plotly Dash dashboard, all started with Docker Compose.
 
 **Live dashboard:** <https://gopalinternship-unibasel.github.io/realtime-seismic-analysis/> (a static copy that the real pipeline writes on GitHub Actions on an hourly schedule, in practice every 4 to 12 hours; see [Live dashboard](#live-dashboard)).
 

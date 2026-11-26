@@ -2,7 +2,7 @@
 
 Everything runs in Docker: Kafka (KRaft), a Spark standalone cluster (1 master, 2 workers), the Spark Structured Streaming job, PostgreSQL, the live USGS producer, the replay producer and the Plotly Dash dashboard. All commands below are for **PowerShell**, run from the project folder (the folder that contains `docker-compose.yml`).
 
-The individual commands behind the scripts are listed in [docs/commands.md](docs/commands.md).
+The individual commands behind the scripts are listed in [docs/commands.txt](docs/commands.txt).
 
 ## 1. Prerequisites
 
@@ -182,13 +182,6 @@ Upgrading a stack that ran an older version: `start.ps1` without `-Reset` is eno
 - The browser test's documented `npm install` in `tests\e2e` was run on this PC by the QA pass of 9 Nov 2026; the fix round ran the same script from a folder that already had Playwright 1.56.1 (29 of 29 checks passed).
 - The dashboard runs on Flask's development server (fine on localhost, not for a public deployment).
 - Spark runs only inside the containers; running the job with a Windows-host Python/Spark is not supported.
-
-## 11. What only the repository owner can do
-
-- Decide whether to change the CV wording now that the claims are backed by the running code (see the commit messages for what changed).
-- Push the commits (they are local only) and decide whether to copy the fixes back to the original Desktop folder.
-- Remove the old stopped containers, images and volumes of earlier copies (`seismic-spark-dis-workshop*`) if he no longer needs them; they were left untouched.
-- Remove the per-service images `cvfix-seismic-spark-master`, `-spark-worker-1`, `-spark-worker-2`, `-streaming-job` and `-replay-producer` if he wants the space back (`docker image rm ...`): an earlier version of this copy's compose file built them; the current one uses only `cvfix-seismic-spark` and `cvfix-seismic-dashboard`.
 
 ## 12. Live dashboard on GitHub Pages
 
