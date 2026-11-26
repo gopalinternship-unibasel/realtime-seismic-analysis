@@ -32,9 +32,13 @@ BVALUE_SLIDE = "1 hour"
 # Longest window above; events this far before/after a batch can share a window with it.
 MAX_WINDOW_HOURS = 24
 
-DEFAULT_BASELINE_MEAN = 0.5
-DEFAULT_BASELINE_STD = 1.0
 MIN_BASELINE_STD = 0.1
+# A cell missing from the baseline had no event in the 90-day catalogue (the baselines job lists every
+# cell with one or more), so its history is 0 events per window. It used to get a made-up mean of 0.5
+# and std of 1.0, which scored 3 events in a never-active cell (z = 2.5) far below 3 events in a cell
+# with one old event (z = 30).
+DEFAULT_BASELINE_MEAN = 0.0
+DEFAULT_BASELINE_STD = MIN_BASELINE_STD
 
 
 def cell_lon_expr(lon: Column) -> Column:

@@ -270,11 +270,13 @@ def forecast_summary(mainshock: dict | None, forecast: dict | None) -> list:
     p = float(forecast["p_value"])
     count = int(forecast["aftershock_count"])
     p_was_fitted = bool(forecast.get("p_estimated", True))
-    p_text = (
-        f"p = {p:.2f} (fitted), R² = {float(forecast['r_squared']):.2f}"
-        if p_was_fitted
-        else f"p = {p:.2f} (generic value: fewer than {MIN_AFTERSHOCKS_FOR_P} aftershocks)"
-    )
+    if p_was_fitted:
+        p_text = f"p = {p:.2f} (fitted), R² = {float(forecast['r_squared']):.2f}"
+    elif count < MIN_AFTERSHOCKS_FOR_P:
+        p_text = f"p = {p:.2f} (generic value: fewer than {MIN_AFTERSHOCKS_FOR_P} aftershocks)"
+    else:
+        # seismo_models.fit_omori_utsu: the best p lay on the edge of its search grid.
+        p_text = f"p = {p:.2f} (generic value: the aftershock times do not determine p)"
     start = forecast_start_time(mainshock, forecast)
     start_text = f" after {start:%Y-%m-%d %H:%M} UTC" if start is not None else ""
     lines = [

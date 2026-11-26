@@ -67,9 +67,12 @@ def test_anomaly_windows_only_touch_windows_of_the_current_batch(spark):
 
 
 def test_unknown_cells_use_default_baseline(spark):
+    # A cell missing from the baseline had no event in 90 days: mean 0 and the minimum std (0.1), so
+    # 3 events there score z = 30, not the old 2.5 of a made-up mean 0.5 and std 1.0.
     batch = events(spark, [(f"x{i}", 5 * i, 3.0, "10:10") for i in range(3)])
     flagged = anomaly_windows(batch, batch, baselines(spark), 2.0, 3).collect()
-    assert flagged and all(r["baseline_mean"] == 0.5 and r["baseline_std"] == 1.0 for r in flagged)
+    assert flagged and all(r["baseline_mean"] == 0.0 and r["baseline_std"] == 0.1 for r in flagged)
+    assert all(abs(r["z_score"] - r["event_count"] / 0.1) < 1e-9 for r in flagged)
 
 
 def test_bvalue_windows_accumulate_small_batches(spark):

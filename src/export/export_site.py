@@ -82,7 +82,7 @@ def export_events(engine, max_events: int) -> tuple[dict, int]:
     total = int(dash.query_df("SELECT COUNT(*) AS n FROM seismic_events", None, engine)["n"].iloc[0])
     df = dash.query_df(
         """
-        SELECT event_id, event_time, latitude, longitude, depth_km, magnitude, place, source, cell_id, region_id
+        SELECT event_id, event_time, latitude, longitude, depth_km, magnitude, place, source, cell_id, region_id, event_type
         FROM seismic_events
         ORDER BY event_time DESC, event_id
         LIMIT :limit
@@ -102,10 +102,13 @@ def export_events(engine, max_events: int) -> tuple[dict, int]:
             r.source,
             text(r.cell_id),
             text(r.region_id),
+            text(r.event_type),
         ]
         for r in df.itertuples(index=False)
     ]
-    columns = ["id", "time", "lat", "lon", "depth_km", "mag", "place", "source", "cell_id", "region_id"]
+    # "type" is the USGS event type (earthquake, quarry blast, explosion, ...): the analytics use earthquakes
+    # only, and the page labels the others.
+    columns = ["id", "time", "lat", "lon", "depth_km", "mag", "place", "source", "cell_id", "region_id", "type"]
     return table(columns, rows), total
 
 

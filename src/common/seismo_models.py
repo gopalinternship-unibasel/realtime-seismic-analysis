@@ -15,6 +15,10 @@ AFTERSHOCK_WINDOW_DAYS = 7
 MIN_AFTERSHOCKS = 3
 MIN_AFTERSHOCKS_FOR_P = 5
 GENERIC_P = 1.08
+# The grid p is searched on. A best p on its edge means the likelihood still rises there: the
+# aftershock times do not pin p down, and the generic p is used instead.
+P_GRID_MIN = 0.30
+P_GRID_MAX = 2.50
 
 
 def _bin_index(values: np.ndarray, bin_width: float) -> np.ndarray:
@@ -202,7 +206,10 @@ def fit_omori_utsu(
     maximised by K = n / integral(0..T), and p is chosen on a 0.01 grid in [0.3, 2.5]
     (Ogata 1983, with c held fixed). Quiet time after the last aftershock therefore lowers
     the forecast, unlike a least-squares fit to the non-empty hourly bins only. Sequences
-    with fewer than MIN_AFTERSHOCKS_FOR_P aftershocks keep p at GENERIC_P and fit K only.
+    with fewer than MIN_AFTERSHOCKS_FOR_P aftershocks keep p at GENERIC_P and fit K only, and
+    so does a sequence whose best p lies on the edge of the grid: the data do not determine
+    p then (the M6.8 off Timor-Leste on 24 Nov 2026 gave p = 0.30 from 5 aftershocks 84 to 266
+    km away, which quadrupled its 6-hour forecast against the generic p).
 
     The forecast is the expected number of aftershocks in the hour and the six hours
     after ``forecast_from_hours`` (the time the forecast is made, e.g. "now"); it never
@@ -220,14 +227,22 @@ def fit_omori_utsu(
 
     p_estimated = n >= MIN_AFTERSHOCKS_FOR_P
     best = None
-    for p_value in np.round(np.arange(0.30, 2.5001, 0.01), 2) if p_estimated else [GENERIC_P]:
-        integral = omori_integral(c_days, float(p_value), 0.0, t_end)
-        if integral <= 0:
-            continue
-        k_value = n / integral
-        log_likelihood = n * math.log(k_value) - float(p_value) * sum_log - n
-        if best is None or log_likelihood > best[0]:
-            best = (log_likelihood, float(p_value), k_value)
+    def best_fit(p_values):
+        found = None
+        for p_value in p_values:
+            integral = omori_integral(c_days, float(p_value), 0.0, t_end)
+            if integral <= 0:
+                continue
+            k_value = n / integral
+            log_likelihood = n * math.log(k_value) - float(p_value) * sum_log - n
+            if found is None or log_likelihood > found[0]:
+                found = (log_likelihood, float(p_value), k_value)
+        return found
+
+    best = best_fit(np.round(np.arange(P_GRID_MIN, P_GRID_MAX + 0.0001, 0.01), 2) if p_estimated else [GENERIC_P])
+    if best is not None and p_estimated and best[1] in (P_GRID_MIN, P_GRID_MAX):
+        p_estimated = False
+        best = best_fit([GENERIC_P])
     if best is None:
         return None
     _ll, p_value, k_value = best

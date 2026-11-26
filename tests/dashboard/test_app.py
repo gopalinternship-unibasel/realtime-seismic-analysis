@@ -222,6 +222,9 @@ def test_forecast_summary_is_wrapping_html_with_the_generic_p_note_and_stale_war
     assert "M5.5 74 km NE of Hasaki, Japan" in text
     # The phrase QA saw clipped as "generic p=1.08 (under 5 afte" is complete.
     assert "p = 1.08 (generic value: fewer than 5 aftershocks)" in text
+    # Five or more aftershocks and still the generic p: the fit's best p lay on the edge of its grid.
+    undetermined = text_of(dash_app.forecast_summary(main, {**forecast, "aftershock_count": 5}))
+    assert "p = 1.08 (generic value: the aftershock times do not determine p)" in undetermined
     assert "0.08 in the next 6 hours" in text and "after 2026-11-09 03:07 UTC" in text
     assert "Not refitted" not in text and "Inactive" not in text
     # The origin is stored to 4 decimals of an hour: 6.2047 h after 04:47:43 is 10:59:59.9, shown as 11:00.

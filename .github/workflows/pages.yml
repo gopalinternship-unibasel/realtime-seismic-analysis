@@ -42,7 +42,7 @@ jobs:
     timeout-minutes: 75
     environment:
       name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+      url: ${{ steps.deployment.outputs.page_url || steps.deployment-retry.outputs.page_url }}
     steps:
       - uses: actions/checkout@v7
 
@@ -110,8 +110,21 @@ jobs:
         with:
           path: _site
 
+      # 4 of 41 runs from 14 to 25 Nov 2026 failed here with 'No artifacts named "github-pages" were found
+      # for this workflow run' right after the upload step had succeeded, which left the page unchanged
+      # for up to a day. The deploy is tried once more after a minute.
       - name: Deploy to GitHub Pages
         id: deployment
+        continue-on-error: true
+        uses: actions/deploy-pages@v5
+
+      - name: Wait before trying the deploy again
+        if: steps.deployment.outcome == 'failure'
+        run: sleep 60
+
+      - name: Deploy to GitHub Pages (second try)
+        id: deployment-retry
+        if: steps.deployment.outcome == 'failure'
         uses: actions/deploy-pages@v5
 
       - name: Pipeline status

@@ -15,6 +15,10 @@
  * per mainshock), the observed aftershocks per hour, and the points of the fitted curve and the forecast.
  * Not ported: the 10 s auto-refresh. The page shows one run; the workflow rewrites it on an hourly
  * schedule (GitHub starts scheduled jobs late and skips some, so in practice every few hours).
+ * One rule differs from Dash: the sliding windows the export holds include ones that were still open when
+ * the data was written (they end after the newest event of their source, up to half a day later, and hold
+ * only part of their data). A running Dash page fills them as data arrives; this one-run copy leaves them
+ * out of the map, the counts, the b-value chart and the alerts.
  */
 (function () {
   "use strict";
@@ -101,7 +105,8 @@
     var dark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
     return dark
       ? { text: "#e2e8f0", grid: "#334155", land: "#334155", ocean: "#0f2a44", border: "#64748b", bar: "#64748b",
-          line: "#60a5fa", vrect: "#7f1d1d", vrectOpacity: 0.55, mapLine: "#94a3b8" }
+          // A dark red band hid the red forecast points; a slate band keeps them visible.
+          line: "#60a5fa", vrect: "#475569", vrectOpacity: 0.35, mapLine: "#94a3b8" }
       : { text: "#111827", grid: "#e5e7eb", land: "rgb(243,244,246)", ocean: "rgb(229,247,255)", border: "#9ca3af",
           bar: "#94a3b8", line: "#1d4ed8", vrect: "#fee2e2", vrectOpacity: 0.5, mapLine: "#9ca3af" };
   }
@@ -144,13 +149,19 @@
         m.clock_ms = m.clock ? Date.parse(m.clock) : null;
         m.forecast.start_ms = m.forecast.start ? Date.parse(m.forecast.start) : null;
       });
+      // A window is closed once its end is not after the newest event of its source (see the header).
+      var clocks = v[0].newest_event || {};
+      var closed = function (w) {
+        var clock = clocks[w.source] ? Date.parse(clocks[w.source]) : null;
+        return clock === null || w.window_end_ms <= clock;
+      };
       return {
         meta: v[0],
         now: Date.parse(v[0].generated_at),
         events: events,
-        windows: rowsToObjects(v[2], ["window_end"]),
+        windows: rowsToObjects(v[2], ["window_end"]).filter(closed),
         regions: rowsToObjects(v[3], []),
-        bvalues: rowsToObjects(v[4], ["window_end"]),
+        bvalues: rowsToObjects(v[4], ["window_end"]).filter(closed),
         mainshocks: mainshocks,
         status: v[6],
       };
@@ -252,7 +263,9 @@
     var f = m.forecast, status = "";
     if (!m.active) { status = " (inactive)"; }
     else if (isStale(f.start_ms, m.clock_ms, true)) { status = " (not refitted since " + fmtMinutes(f.start_ms).slice(5) + ")"; }
-    return "M" + fixed(m.mag, 1) + " " + (m.place || m.id) + " · " + fmtMinutes(m.time_ms) + " UTC · next 6 h ≈ " +
+    var place = m.place || m.id, magText = "M" + fixed(m.mag, 1);
+    // The replay places already start with the magnitude ("Demo M5.6 - Northern California").
+    return (place.indexOf(magText) >= 0 ? "" : magText + " ") + place + " · " + fmtMinutes(m.time_ms) + " UTC · next 6 h ≈ " +
       fixed(f.next_six_hours, 2) + status;
   }
 
@@ -288,13 +301,19 @@
       input.checked = state.regions.indexOf(o.region_id) >= 0;
       input.addEventListener("change", function () {
         state.regions = Array.prototype.map.call(list.querySelectorAll("input:checked"), function (i) { return i.value; });
+        // The summary changes with the ticks too (it used to keep the old count until another control changed).
+        showRegionSummary(options.length);
         render();
       });
-      var label = o.region_id + "  (" + o.windows + " windows" + (o.alerts ? ", " + o.alerts + " alerts" : "") + ")";
+      var label = o.region_id + "  (" + o.windows + " windows" + (o.alerts ? ", " + o.alerts + " alert windows" : "") + ")";
       list.appendChild(el("label", {}, [input, " " + label]));
     });
+    showRegionSummary(options.length);
+  }
+
+  function showRegionSummary(optionCount) {
     $("bvalue-regions-summary").textContent = state.regions.length
-      ? state.regions.length + " of " + options.length + " regions chosen"
+      ? state.regions.length + " of " + optionCount + " regions chosen"
       : "Choose regions";
   }
 
@@ -317,8 +336,15 @@
   // ------------------------------------------------------------------ figures
 
   function mapHover(e) {
-    return (e.place || "") + "<br>M " + (isNum(e.mag) ? e.mag : "n/a") + "<br>" + fmtSeconds(e.time_ms) + " UTC<br>" +
+    // USGS also lists quarry blasts, explosions and ice quakes; the analytics leave them out.
+    var kind = e.type && e.type !== "earthquake" ? e.type + ", " : "";
+    return (e.place || "") + "<br>" + kind + "M " + (isNum(e.mag) ? e.mag : "n/a") + "<br>" + fmtSeconds(e.time_ms) + " UTC<br>" +
       sourceLabel(e.source);
+  }
+
+  /* "R1" for one source; "Live R1" / "Demo R1" when both are shown, since each source numbers its own regions. */
+  function regionName(r, multiSource) {
+    return (multiSource ? (r.source === "replay" ? "Demo " : "Live ") : "") + "R" + r.cluster_id;
   }
 
   function radiusText(r) {
@@ -332,20 +358,43 @@
   function clusterColor(id) { return CLUSTER_COLORS[Math.abs(Math.round(id)) % CLUSTER_COLORS.length]; }
 
   function drawMap(events, cells, regions) {
-    var t = theme(), traces = [];
+    var t = theme(), traces = [], phone = window.innerWidth <= 640;
     var shown = events.slice(0, MAP_EVENT_LIMIT);
-    if (shown.length) {
+    var mags = shown.filter(function (e) { return isNum(e.mag); }).map(function (e) { return e.mag; });
+    var cmin = mags.length ? Math.min.apply(null, mags) : 0, cmax = mags.length ? Math.max.apply(null, mags) : 1;
+    var multiSource = selectedSources().length > 1;
+    // Live and replay events as two traces with one colour scale: the synthetic replay events are diamonds,
+    // so they are not read as real earthquakes.
+    [["usgs-live", "Events (live USGS feed)", "circle"], ["replay", "Replay demo events (synthetic)", "diamond"]].forEach(function (s, i) {
+      var part = shown.filter(function (e) { return e.source === s[0] && isNum(e.mag); });
+      if (!part.length) { return; }
       traces.push({
-        type: "scattergeo", mode: "markers", name: "Events", hoverinfo: "text",
-        lon: shown.map(function (e) { return e.lon; }),
-        lat: shown.map(function (e) { return e.lat; }),
-        text: shown.map(mapHover),
+        type: "scattergeo", mode: "markers", name: s[1], hoverinfo: "text",
+        lon: part.map(function (e) { return e.lon; }),
+        lat: part.map(function (e) { return e.lat; }),
+        text: part.map(mapHover),
         marker: {
-          size: shown.map(function (e) { return Math.max(isNum(e.mag) ? e.mag : 1, 0.5) * 3 + 3; }),
-          color: shown.map(function (e) { return isNum(e.mag) ? e.mag : 0; }),
-          colorscale: "Viridis", showscale: true, opacity: 0.72,
-          colorbar: { title: { text: "Magnitude" }, x: 1.0, thickness: 12, len: 0.8 },
+          symbol: s[2],
+          size: part.map(function (e) { return (Math.max(e.mag, 0.5) * 3 + 3) * (phone ? 0.6 : 1); }),
+          color: part.map(function (e) { return e.mag; }),
+          colorscale: "Viridis", cmin: cmin, cmax: cmax, opacity: 0.72,
+          showscale: traces.length === 0,
+          colorbar: phone
+            ? { title: { text: "Mag" }, x: 1.0, thickness: 8, len: 0.5 }
+            : { title: { text: "Magnitude" }, x: 1.0, thickness: 12, len: 0.8 },
         },
+      });
+    });
+    // Events without a magnitude: small and grey, not coloured like the smallest magnitude.
+    var noMag = shown.filter(function (e) { return !isNum(e.mag); });
+    if (noMag.length) {
+      traces.push({
+        type: "scattergeo", mode: "markers", name: "No magnitude", hoverinfo: "text", showlegend: false,
+        lon: noMag.map(function (e) { return e.lon; }),
+        lat: noMag.map(function (e) { return e.lat; }),
+        text: noMag.map(mapHover),
+        marker: { size: phone ? 4 : 6, color: "#9ca3af", opacity: 0.72,
+          symbol: noMag.map(function (e) { return e.source === "replay" ? "diamond" : "circle"; }) },
       });
     }
     if (cells.length) {
@@ -354,9 +403,9 @@
         lon: cells.map(function (c) { return c.grid_lon + 0.5; }),
         lat: cells.map(function (c) { return c.grid_lat + 0.5; }),
         text: cells.map(function (c) {
-          return "Anomalous cell " + c.cell_id + "<br>max 6 h count=" + Math.round(c.max_count) +
-            "<br>max z=" + (c.max_z === null ? "n/a" : fixed(c.max_z, 2)) +
-            "<br>active region: " + (c.cluster_id === null ? "none" : "R" + c.cluster_id) +
+          return "Anomalous cell " + c.cell_id + "<br>max 6 h count in the time range=" + Math.round(c.max_count) +
+            "<br>max z in the time range=" + (c.max_z === null ? "n/a" : fixed(c.max_z, 2)) +
+            "<br>active region: " + (c.cluster_id === null ? "none" : regionName({ source: c.source, cluster_id: c.cluster_id }, multiSource)) +
             "<br>" + sourceLabel(c.source);
         }),
         marker: {
@@ -371,18 +420,18 @@
         textposition: "top center",
         lon: regions.map(function (r) { return r.centroid_lon; }),
         lat: regions.map(function (r) { return r.centroid_lat; }),
-        text: regions.map(function (r) { return "R" + r.cluster_id; }),
+        text: regions.map(function (r) { return regionName(r, multiSource); }),
         hovertext: regions.map(function (r) {
-          return "Active region R" + r.cluster_id + " (" + sourceLabel(r.source) + ")<br>" + r.cell_count +
+          return "Active region " + regionName(r, multiSource) + " (" + sourceLabel(r.source) + ")<br>" + r.cell_count +
             " cells, radius " + radiusText(r) + "<br>max z=" + fixed(r.max_z_score, 2);
         }),
         marker: { size: 14, symbol: "x", color: regions.map(function (r) { return clusterColor(r.cluster_id); }) },
         textfont: { color: t.text },
       });
     }
-    var layout = baseLayout(window.innerWidth <= 640 ? 380 : 520);
+    var layout = baseLayout(phone ? 380 : 520);
     layout.margin = { r: 0, t: 20, l: 0, b: 0 };
-    layout.legend = { orientation: "h" };
+    layout.legend = phone ? { orientation: "h", y: -0.02, font: { size: 10 } } : { orientation: "h" };
     layout.geo = {
       projection: { type: "natural earth" }, showland: true, landcolor: t.land, showcountries: true,
       countrycolor: t.mapLine, coastlinecolor: t.mapLine, showocean: true, oceancolor: t.ocean, bgcolor: "rgba(0,0,0,0)",
@@ -406,25 +455,36 @@
         var key = b.region_id + "\u0000" + b.source;
         (groups[key] || (groups[key] = [])).push(b);
       });
+      var alertLegendShown = false;
       Object.keys(groups).sort().forEach(function (key) {
         var g = groups[key], name = multiSource ? g[0].region_id + " (" + sourceLabel(g[0].source) + ")" : String(g[0].region_id);
+        // A window is stored only with 20 or more events above Mc, so hours without one are gaps: a null point
+        // breaks the line there instead of drawing a straight line across a day without an estimate.
+        var x = [], y = [], sigma = [], custom = [];
+        g.forEach(function (b, i) {
+          if (i > 0 && b.window_end_ms - g[i - 1].window_end_ms > 3600 * 1000) {
+            x.push(null); y.push(null); sigma.push(null); custom.push([null, null]);
+          }
+          x.push(plotTime(b.window_end_ms)); y.push(b.b_value); sigma.push(b.b_sigma); custom.push([b.event_count, b.long_term_b]);
+        });
         traces.push({
-          type: "scatter", mode: "lines+markers", name: name,
-          x: g.map(function (b) { return plotTime(b.window_end_ms); }),
-          y: g.map(function (b) { return b.b_value; }),
-          error_y: { type: "data", array: g.map(function (b) { return b.b_sigma; }), visible: true },
-          customdata: g.map(function (b) { return [b.event_count, b.long_term_b]; }),
+          type: "scatter", mode: "lines+markers", name: name, connectgaps: false,
+          x: x, y: y,
+          error_y: { type: "data", array: sigma, visible: true },
+          customdata: custom,
           hovertemplate: "%{x}<br>b=%{y:.2f}<br>events above Mc=%{customdata[0]}<br>long-term b=%{customdata[1]:.2f}<extra>" + name + "</extra>",
         });
         var alerts = g.filter(function (b) { return b.is_alert; });
         if (alerts.length) {
           traces.push({
-            type: "scatter", mode: "markers", name: name + " alert", showlegend: false,
+            type: "scatter", mode: "markers", name: "b-value alert: |b − long-term b| > max(0.25, 2σ)",
+            legendgroup: "alerts", showlegend: !alertLegendShown,
             x: alerts.map(function (b) { return plotTime(b.window_end_ms); }),
             y: alerts.map(function (b) { return b.b_value; }),
             marker: { color: "#dc2626", size: 11, symbol: "circle-open", line: { width: 2 } },
             hovertemplate: "b-value alert<br>b=%{y:.2f}<extra>" + name + "</extra>",
           });
+          alertLegendShown = true;
         }
       });
     } else {
@@ -435,6 +495,8 @@
     layout.yaxis = { title: { text: "b-value" }, gridcolor: t.grid };
     layout.margin = { r: 20, t: 20, l: 50, b: 40 };
     layout.legend = { orientation: "h", y: -0.25 };
+    // Plotly's default colours start with red, the colour of the alert circles: the region lines leave it out.
+    layout.colorway = ["#1f77b4", "#2ca02c", "#9467bd", "#ff7f0e", "#8c564b", "#e377c2", "#17becf", "#bcbd22", "#7f7f7f"];
     draw("bvalue-chart", traces, layout);
   }
 
@@ -452,13 +514,18 @@
     var f = m.forecast, info = D.mainshocks;
     var pText = f.p_estimated
       ? "p = " + fixed(f.p, 2) + " (fitted), R² = " + (isNum(f.r_squared) ? fixed(f.r_squared, 2) : "n/a")
-      : "p = " + fixed(f.p, 2) + " (generic value: fewer than " + info.min_aftershocks_for_p + " aftershocks)";
+      : f.aftershocks < info.min_aftershocks_for_p
+        ? "p = " + fixed(f.p, 2) + " (generic value: fewer than " + info.min_aftershocks_for_p + " aftershocks)"
+        // seismo_models.fit_omori_utsu: the best p lay on the edge of its search grid.
+        : "p = " + fixed(f.p, 2) + " (generic value: the aftershock times do not determine p)";
     var startText = f.start_ms !== null && f.start_ms !== undefined ? " after " + fmtMinutes(f.start_ms) + " UTC" : "";
     box.appendChild(el("div", {}, [el("strong", { text: "M" + fixed(m.mag, 1) + " " + (m.place || m.id) + " · " + fmtMinutes(m.time_ms) + " UTC" })]));
     box.appendChild(el("div", { text: f.aftershocks + " aftershocks within " + Math.round(info.radius_km) + " km and " + info.window_days +
       " days · K = " + fixed(f.k, 1) + "/day, c = " + fixed(f.c, 2) + " d, " + pText }));
-    box.appendChild(el("div", { text: "Expected aftershocks" + startText + ": " + fixed(f.next_hour, 2) + " in the next hour, " +
-      fixed(f.next_six_hours, 2) + " in the next 6 hours" }));
+    // The aftershocks are all smaller events in the catalogue around the mainshock, so the expected number
+    // has no lower magnitude of its own: it is of whatever magnitudes the network records there.
+    box.appendChild(el("div", { text: "Expected aftershocks" + startText + " (of the magnitudes the catalogue records there): " +
+      fixed(f.next_hour, 2) + " in the next hour, " + fixed(f.next_six_hours, 2) + " in the next 6 hours" }));
     if (!m.active) {
       box.appendChild(el("div", { className: "forecast-warning", text: "Inactive: more than 30 days before the latest event; this is its last forecast." }));
     } else if (isStale(f.start_ms, m.clock_ms, true)) {
@@ -504,15 +571,18 @@
 
   // ------------------------------------------------------------------ the rest of the page
 
-  function metricCard(label, value, id) {
-    return el("div", { className: "card", id: id }, [el("div", { className: "metric-label", text: label }),
-      el("div", { className: "metric-value", text: String(value) })]);
+  function metricCard(label, value, id, note) {
+    var parts = [el("div", { className: "metric-label", text: label }), el("div", { className: "metric-value", text: String(value) })];
+    if (note) { parts.push(el("div", { className: "metric-label", text: note })); }
+    return el("div", { className: "card", id: id }, parts);
   }
 
   function drawMetrics(events, cells, regions) {
     var bw = bvalueWindows(), alerts = bw.filter(function (b) { return b.is_alert; }).length;
     var counts = D.mainshocks.active_counts, active = 0;
     selectedSources().forEach(function (s) { active += counts[s] || 0; });
+    // Only mainshocks with 3 or more aftershocks get a forecast, so the list below shows fewer than this count.
+    var forecasts = mainshockOptions().filter(function (m) { return m.active; }).length;
     var box = $("metrics");
     box.textContent = "";
     [
@@ -520,9 +590,10 @@
       ["Anomalous cells", cells.length, "metric-anomalous-cells"],
       ["Active regions (K-Means)", regions.length, "metric-active-regions"],
       ["b-value windows", thousands(bw.length), "metric-bvalue-windows"],
-      ["b-value alerts", alerts, "metric-bvalue-alerts"],
-      ["Active mainshocks", active, "metric-mainshocks"],
-    ].forEach(function (c) { box.appendChild(metricCard(c[0], c[1], c[2])); });
+      // Windows slide by 1 hour, so one change in b raises several alert windows in a row.
+      ["b-value alert windows", alerts, "metric-bvalue-alerts"],
+      ["Active mainshocks (M ≥ 5)", active, "metric-mainshocks", forecasts + " with a forecast"],
+    ].forEach(function (c) { box.appendChild(metricCard(c[0], c[1], c[2], c[3])); });
   }
 
   function drawRegionsTable(regions) {
@@ -545,12 +616,14 @@
         (caps.length ? "MAX_KMEANS_CLUSTERS = " + Math.min.apply(null, caps) : "MAX_KMEANS_CLUSTERS") +
         " regions can cover, so cells far apart share a region. Raise MAX_KMEANS_CLUSTERS in .env of the local setup to split them." }));
     }
-    var head = ["Region", "Source", "Centroid (lon, lat)", "Cells", "Radius", "Max z", "Max 6 h count", "Cell ids"];
+    // The regions are built from the last 24 hours of data, whatever the time range above.
+    var head = ["Region", "Source", "Centroid (lon, lat)", "Cells", "Radius", "Max z (last 24 h)", "Max 6 h count (last 24 h)", "Cell ids"];
+    var multiSource = selectedSources().length > 1;
     var table = el("table", { id: "regions-table-content" }, [
       el("thead", {}, [el("tr", {}, head.map(function (h) { return el("th", { text: h }); }))]),
       el("tbody", {}, regions.map(function (r) {
         return el("tr", {}, [
-          el("td", { text: "R" + r.cluster_id }),
+          el("td", { text: regionName(r, multiSource) }),
           el("td", { text: sourceLabel(r.source) }),
           el("td", { text: fixed(r.centroid_lon, 2) + ", " + fixed(r.centroid_lat, 2) }),
           el("td", { text: r.cell_count }),
@@ -573,7 +646,7 @@
     // meta.commit is set by the GitHub Actions run; an export made by hand has none.
     origin.appendChild(document.createTextNode(meta.commit
       ? "This page was written by the pipeline's latest run on GitHub Actions (Kafka, Spark and PostgreSQL started there), at " +
-        fmtSeconds(D.now) + " UTC (" + agoText + "). The schedule asks for a new run every hour; GitHub starts scheduled jobs late and skips some, so this copy can be several hours old. It is not a continuously running server. "
+        fmtSeconds(D.now) + " UTC (" + agoText + "). The schedule asks for a new run every hour, but GitHub starts scheduled jobs late and skips many: a new copy usually comes every few hours and can take up to about a day. It is not a continuously running server. "
       : "This page was written by a local run of the exporter, at " + fmtSeconds(D.now) + " UTC (" + agoText +
         "). It shows that one run; it is not a continuously running server. "));
     if (meta.commit) {
@@ -602,12 +675,16 @@
     body.textContent = "";
     var sources = Object.keys(SOURCES);
     var tables = Object.keys(s.rows);
+    // Rejected records that have no source are exported under "(none)": give them a column of their own.
+    tables.forEach(function (t) {
+      Object.keys(s.rows[t]).forEach(function (src) { if (sources.indexOf(src) < 0) { sources.push(src); } });
+    });
     body.appendChild(el("h4", { text: "Rows stored per table and data source" }));
     body.appendChild(table2(["Table"].concat(sources.map(sourceLabel)), tables.map(function (t) {
       return [t].concat(sources.map(function (src) { return thousands(s.rows[t][src] || 0); }));
     })));
     body.appendChild(el("h4", { text: "Data clocks (UTC)" }));
-    body.appendChild(table2(["Source", "Newest event", "Latest forecast run used data up to"], sources.map(function (src) {
+    body.appendChild(table2(["Source", "Newest event", "Latest forecast run used data up to"], Object.keys(SOURCES).map(function (src) {
       var run = s.forecast_runs[src], newest = D.meta.newest_event[src];
       return [sourceLabel(src), newest ? fmtSeconds(Date.parse(newest)) : "no events", run && run.clock ? fmtSeconds(Date.parse(run.clock)) : "no run"];
     })));

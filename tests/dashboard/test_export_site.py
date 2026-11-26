@@ -132,7 +132,7 @@ def test_events_are_newest_first_and_rounded(engine, tmp_path):
     main = next(e for e in events if e["id"] == "main")
     assert main == {"id": "main", "time": "2026-11-09T02:00:00Z", "lat": 38.0, "lon": -122.0, "depth_km": 8.3,
                     "mag": 5.6, "place": "Demo M5.6 - Northern California", "source": "replay",
-                    "cell_id": "-122_38", "region_id": "R-130_+30"}
+                    "cell_id": "-122_38", "region_id": "R-130_+30", "type": "earthquake"}
     assert next(e for e in events if e["id"] == "last")["mag"] is None
     assert {e["source"] for e in events} == {"replay", "usgs-live"}
 

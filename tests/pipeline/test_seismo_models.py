@@ -106,7 +106,22 @@ def test_short_sequences_use_the_generic_p():
     assert short.p_value == 1.08
     # The old fit returned p=0, R²=1 and 6 expected aftershocks in 6 hours for this sequence.
     assert short.next_six_hour_expected < 0.2
-    assert fit_omori_utsu([1.0, 2.0, 3.0, 4.0, 5.0]).p_estimated
+    # Five aftershocks that thin out over time: p is fitted.
+    decaying = fit_omori_utsu([0.5, 1.5, 4.0, 10.0, 30.0])
+    assert decaying.p_estimated and 0.3 < decaying.p_value < 2.5
+
+
+def test_a_p_on_the_edge_of_the_grid_falls_back_to_the_generic_p():
+    # The M6.8 off Timor-Leste of 24 Nov 2026: 5 aftershocks, best p on the grid's lower edge (0.30),
+    # shown as "p = 0.30 (fitted)" with a 6-hour forecast four times the one of the generic p.
+    timor = fit_omori_utsu([6.23, 43.56, 45.09, 45.9, 65.5])
+    assert not timor.p_estimated and timor.p_value == 1.08
+    # A steady rate (no decay at all) cannot fix p either.
+    steady = fit_omori_utsu([1.0, 2.0, 3.0, 4.0, 5.0])
+    assert not steady.p_estimated and steady.p_value == 1.08
+    # K is refitted for the generic p: n over the integral of (t + c)^-p across the observed time.
+    expected_k = 5 / omori_integral(0.05, 1.08, 0.0, 65.5 / 24.0)
+    assert abs(timor.k_value - expected_k) < 1e-3
 
 
 def test_aftershock_hours_keeps_events_within_radius_after_mainshock():
