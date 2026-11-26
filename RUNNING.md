@@ -2,6 +2,8 @@
 
 Everything runs in Docker: Kafka (KRaft), a Spark standalone cluster (1 master, 2 workers), the Spark Structured Streaming job, PostgreSQL, the live USGS producer, the replay producer and the Plotly Dash dashboard. All commands below are for **PowerShell**, run from the project folder (the folder that contains `docker-compose.yml`).
 
+The individual commands behind the scripts are listed in [docs/commands.md](docs/commands.md).
+
 ## 1. Prerequisites
 
 | Need | Details |

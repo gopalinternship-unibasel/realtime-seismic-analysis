@@ -5,6 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
   <title>Real-Time Seismic Activity Analysis</title>
+  <meta name="description" content="Static Plotly.js copy of a Plotly Dash dashboard for a Kafka, Spark Structured Streaming and PostgreSQL pipeline that analyses USGS earthquake data: anomaly z-scores, K-Means regions, b-value monitoring and Omori-Utsu aftershock forecasts.">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Real-Time Seismic Activity Analysis">
+  <meta property="og:description" content="Kafka, Spark Structured Streaming and PostgreSQL pipeline on USGS earthquake data: anomaly z-scores, K-Means regions, b-value monitoring and Omori-Utsu aftershock forecasts. Static Plotly.js copy of the Plotly Dash dashboard.">
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="style.css">
 </head>
@@ -13,6 +17,7 @@
   <header>
     <h1>Real-Time Seismic Activity Analysis</h1>
     <p class="subtitle">Kafka + Spark Structured Streaming + PostgreSQL, fed by the USGS GeoJSON feed or the replay demo catalogue</p>
+    <p id="stack-note" class="subtitle">This page is a static Plotly.js copy of the Plotly Dash dashboard. Kafka, Spark Structured Streaming (a master and two workers), PostgreSQL and the Dash app run together with Docker Compose. Anomaly z-scores compare each cell's 6-hour event count with its 90-day USGS baseline of 6-hour counts.</p>
     <p id="origin" class="origin">Loading the data of the latest pipeline run ...</p>
     <div id="last-updated" class="updated"></div>
     <div id="load-error" class="db-error" role="alert" hidden></div>
@@ -53,6 +58,7 @@
   <section class="card wide-card scroll-x">
     <h3 class="card-title">Active seismic regions (K-Means over anomalous cells)</h3>
     <div id="regions-table"></div>
+    <p id="regions-note" class="chart-note">z compares a cell's 6-hour count with its 90-day mean and standard deviation. Cells with no past events use a standard deviation of 0.1, so a few events give a large z.</p>
   </section>
 
   <div class="charts-grid">
@@ -80,6 +86,7 @@
       <summary>Pipeline status of the latest run</summary>
       <div id="status-body"></div>
     </details>
+    <p id="status-note" class="chart-note"></p>
   </section>
 
   <footer>

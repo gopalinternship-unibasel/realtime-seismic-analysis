@@ -160,6 +160,31 @@ def test_commit_is_null_without_github_sha(engine, tmp_path, monkeypatch):
     assert data["meta.json"]["commit"] is None
 
 
+def test_run_url_is_written_only_when_github_sets_it(engine, tmp_path, monkeypatch):
+    for name in ("GITHUB_SERVER_URL", "GITHUB_REPOSITORY", "GITHUB_RUN_ID"):
+        monkeypatch.delenv(name, raising=False)
+    _, data = run_export(engine, tmp_path)
+    assert data["meta.json"]["run_url"] is None
+    monkeypatch.setenv("GITHUB_SERVER_URL", "https://github.com")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "someone/some-repo")
+    monkeypatch.setenv("GITHUB_RUN_ID", "12345")
+    _, data = run_export(engine, tmp_path)
+    assert data["meta.json"]["run_url"] == "https://github.com/someone/some-repo/actions/runs/12345"
+
+
+def test_declustered_mainshocks_are_counted_per_source(engine, tmp_path):
+    with closing(psycopg2.connect(DSN)) as conn, conn, conn.cursor() as cur:
+        insert_event(cur, "big_aftershock", T0 + timedelta(hours=3), 5.1, -122.1, 38.1)
+        cur.execute(
+            "INSERT INTO mainshocks (event_id, event_time, magnitude, longitude, latitude, place, source, active, "
+            "larger_event_id) VALUES ('big_aftershock', %s, 5.1, -122.1, 38.1, 'x', 'replay', TRUE, 'main')",
+            (T0 + timedelta(hours=3),),
+        )
+    _, data = run_export(engine, tmp_path)
+    assert data["mainshocks.json"]["declustered_counts"] == {"replay": 1}
+    assert data["mainshocks.json"]["active_counts"] == {"replay": 1}
+
+
 def test_anomaly_windows_regions_and_bvalues(engine, tmp_path):
     _, data = run_export(engine, tmp_path)
     windows = records(data["anomaly_windows.json"])
@@ -178,6 +203,7 @@ def test_mainshock_forecast_and_curve_points(engine, tmp_path):
     _, data = run_export(engine, tmp_path)
     shocks = data["mainshocks.json"]
     assert shocks["active_counts"] == {"replay": 1}
+    assert shocks["declustered_counts"] == {}
     assert shocks["stale_seconds"] == 1
     assert (shocks["radius_km"], shocks["window_days"], shocks["min_aftershocks_for_p"]) == (300, 7, 5)
     assert len(shocks["items"]) == 1
@@ -220,7 +246,7 @@ def test_empty_database_exports_empty_tables(engine, tmp_path):
                     "rejected_records, forecast_runs")
     _, data = run_export(engine, tmp_path)
     assert data["events.json"]["rows"] == [] and data["bvalue_windows.json"]["rows"] == []
-    assert data["mainshocks.json"]["items"] == [] and data["mainshocks.json"]["active_counts"] == {}
+    assert data["mainshocks.json"]["items"] == [] and data["mainshocks.json"]["active_counts"] == {} and data["mainshocks.json"]["declustered_counts"] == {}
     assert data["meta.json"]["newest_event"] == {} and data["status.json"]["rejected"]["total"] == 0
 
 

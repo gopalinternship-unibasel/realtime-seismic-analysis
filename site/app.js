@@ -34,6 +34,8 @@
   var CLUSTER_COLORS = ["#d62728", "#1f77b4", "#2ca02c", "#9467bd", "#ff7f0e", "#8c564b", "#e377c2", "#17becf"];
   var REPO_URL = "https://github.com/gopalinternship-unibasel/realtime-seismic-analysis";
   var OLD_AFTER_HOURS = 3;
+  var FEW_AFTERSHOCKS = 20;
+  var LABEL_MIN_DISTANCE_DEG = 8;
 
   var D = null; // the loaded data
   var state = { source: "all", range: "7d", minMag: 0, regions: null, mainshock: null, selectorsSource: null };
@@ -67,6 +69,26 @@
   function isNum(v) { return typeof v === "number" && isFinite(v); }
 
   function sourceLabel(s) { return SOURCES[s] || s; }
+
+  function isPhone() { return window.innerWidth <= 640; }
+
+  /* An expected count below 0.1 keeps two significant figures (0.004, not 0.00); larger ones keep two decimals. */
+  function fmtExpected(value) {
+    var v = Number(value);
+    if (!isFinite(v) || v <= 0 || v >= 0.1) { return fixed(v, 2); }
+    if (v < 0.0001) { return "less than 0.0001"; }
+    return String(Number(v.toFixed(1 - Math.floor(Math.log10(v)))));
+  }
+
+  /* "R-130_+30" is the 10 x 10 degree box from 130 W to 120 W and 30 N to 40 N. */
+  function boxText(regionId) {
+    var m = /^R([+-]?\d+)_([+-]?\d+)$/.exec(String(regionId));
+    if (!m) { return String(regionId); }
+    var lon = parseInt(m[1], 10), lat = parseInt(m[2], 10);
+    var lonText = lon < 0 ? Math.abs(lon) + "-" + Math.abs(lon + 10) + "\u00b0W" : lon + "-" + (lon + 10) + "\u00b0E";
+    var latText = lat < 0 ? Math.abs(lat) + "-" + Math.abs(lat + 10) + "\u00b0S" : lat + "-" + (lat + 10) + "\u00b0N";
+    return lonText + ", " + latText;
+  }
 
   function selectedSources() {
     return SOURCES[state.source] ? [state.source] : Object.keys(SOURCES);
@@ -123,11 +145,12 @@
     };
   }
 
-  var PLOT_CONFIG = { responsive: true, displaylogo: false };
+  // On phones the toolbar would cover the top of the charts.
+  function plotConfig() { return { responsive: true, displaylogo: false, displayModeBar: !isPhone() }; }
 
   function draw(id, data, layout) {
     if (!window.Plotly) { return; }
-    window.Plotly.react(id, data, layout, PLOT_CONFIG);
+    window.Plotly.react(id, data, layout, plotConfig());
   }
 
   // ------------------------------------------------------------------ loading
@@ -156,13 +179,17 @@
         var clock = clocks[w.source] ? Date.parse(clocks[w.source]) : null;
         return clock === null || w.window_end_ms <= clock;
       };
+      var allWindows = rowsToObjects(v[2], ["window_end"]), allBvalues = rowsToObjects(v[4], ["window_end"]);
+      var windows = allWindows.filter(closed), bvalues = allBvalues.filter(closed);
       return {
         meta: v[0],
         now: Date.parse(v[0].generated_at),
         events: events,
-        windows: rowsToObjects(v[2], ["window_end"]).filter(closed),
+        windows: windows,
         regions: rowsToObjects(v[3], []),
-        bvalues: rowsToObjects(v[4], ["window_end"]).filter(closed),
+        bvalues: bvalues,
+        // Windows that were still open when the data was written: stored, but left out of the page.
+        openWindows: (allWindows.length - windows.length) + (allBvalues.length - bvalues.length),
         mainshocks: mainshocks,
         status: v[6],
       };
@@ -267,7 +294,7 @@
     var place = m.place || m.id, magText = "M" + fixed(m.mag, 1);
     // The replay places already start with the magnitude ("Demo M5.6 - Northern California").
     return (place.indexOf(magText) >= 0 ? "" : magText + " ") + place + " · " + fmtMinutes(m.time_ms) + " UTC · next 6 h ≈ " +
-      fixed(f.next_six_hours, 2) + status;
+      fmtExpected(f.next_six_hours) + status;
   }
 
   function pickMainshock(items, current) {
@@ -306,8 +333,8 @@
         showRegionSummary(options.length);
         render();
       });
-      var label = o.region_id + "  (" + o.windows + " windows" + (o.alerts ? ", " + o.alerts + " alert windows" : "") + ")";
-      list.appendChild(el("label", {}, [input, " " + label]));
+      var label = boxText(o.region_id) + "  (" + o.windows + " windows" + (o.alerts ? ", " + o.alerts + " alert windows" : "") + ")";
+      list.appendChild(el("label", { title: o.region_id }, [input, " " + label]));
     });
     showRegionSummary(options.length);
   }
@@ -348,7 +375,11 @@
     return (multiSource ? (r.source === "replay" ? "Demo " : "Live ") : "") + "R" + r.cluster_id;
   }
 
+  function cellsText(r) { return r.cell_count === 1 ? "1 cell" : String(r.cell_count); }
+
   function radiusText(r) {
+    // One 1-degree cell has no spread around its centre: the radius is not meaningful.
+    if (r.cell_count === 1) { return "\u2013"; }
     var shown = thousands(r.radius_km) + " km";
     if (r.within_radius === false) {
       shown += isNum(r.radius_limit_km) ? " (over the " + thousands(r.radius_limit_km) + " km limit)" : " (over the limit)";
@@ -359,7 +390,7 @@
   function clusterColor(id) { return CLUSTER_COLORS[Math.abs(Math.round(id)) % CLUSTER_COLORS.length]; }
 
   function drawMap(events, cells, regions) {
-    var t = theme(), traces = [], phone = window.innerWidth <= 640;
+    var t = theme(), traces = [], phone = isPhone();
     var shown = events.slice(0, MAP_EVENT_LIMIT);
     var mags = shown.filter(function (e) { return isNum(e.mag); }).map(function (e) { return e.mag; });
     var cmin = mags.length ? Math.min.apply(null, mags) : 0, cmax = mags.length ? Math.max.apply(null, mags) : 1;
@@ -381,7 +412,7 @@
           colorscale: "Viridis", cmin: cmin, cmax: cmax, opacity: 0.72,
           showscale: traces.length === 0,
           colorbar: phone
-            ? { title: { text: "Mag" }, x: 1.0, thickness: 8, len: 0.5 }
+            ? { title: { text: "M" }, x: 1.0, thickness: 8, len: 0.5 }
             : { title: { text: "Magnitude" }, x: 1.0, thickness: 12, len: 0.8 },
         },
       });
@@ -416,16 +447,33 @@
       });
     }
     if (regions.length) {
+      // Labels go to the regions with the highest max z first, and a region within about 8 degrees of one already
+      // labelled gets none, so they do not print over each other. Every marker keeps its hover text.
+      var labelled = [], labels = regions.map(function () { return ""; });
+      regions.map(function (r, i) { return i; }).sort(function (a, b) {
+        var za = isNum(regions[a].max_z_score) ? regions[a].max_z_score : -Infinity;
+        var zb = isNum(regions[b].max_z_score) ? regions[b].max_z_score : -Infinity;
+        return zb - za;
+      }).forEach(function (i) {
+        var r = regions[i];
+        var near = labelled.some(function (o) {
+          var dlon = Math.abs(r.centroid_lon - o.centroid_lon);
+          if (dlon > 180) { dlon = 360 - dlon; }
+          // A label is wider than tall: about 8 degrees apart in latitude, twice that in longitude.
+          return dlon < 2 * LABEL_MIN_DISTANCE_DEG && Math.abs(r.centroid_lat - o.centroid_lat) < LABEL_MIN_DISTANCE_DEG;
+        });
+        if (!near) { labelled.push(r); labels[i] = regionName(r, multiSource); }
+      });
       traces.push({
         // On phones the labels crowd over the western US and the colour bar cuts them: hover only there.
         type: "scattergeo", mode: phone ? "markers" : "markers+text", name: "K-Means active regions", hoverinfo: "text",
         textposition: "top center",
         lon: regions.map(function (r) { return r.centroid_lon; }),
         lat: regions.map(function (r) { return r.centroid_lat; }),
-        text: regions.map(function (r) { return regionName(r, multiSource); }),
+        text: labels,
         hovertext: regions.map(function (r) {
-          return "Active region " + regionName(r, multiSource) + " (" + sourceLabel(r.source) + ")<br>" + r.cell_count +
-            " cells, radius " + radiusText(r) + "<br>max z=" + fixed(r.max_z_score, 2);
+          return "Active region " + regionName(r, multiSource) + " (" + sourceLabel(r.source) + ")<br>" +
+            (r.cell_count === 1 ? "1 cell" : r.cell_count + " cells, radius " + radiusText(r)) + "<br>max z=" + fixed(r.max_z_score, 2);
         }),
         marker: { size: 14, symbol: "x", color: regions.map(function (r) { return clusterColor(r.cluster_id); }) },
         textfont: { color: t.text },
@@ -442,7 +490,7 @@
   }
 
   function drawBvalues(rows) {
-    var phone = window.innerWidth <= 640;
+    var phone = isPhone();
     var t = theme(), traces = [], layout = baseLayout(0);
     var chosen = {};
     state.regions.forEach(function (r) { chosen[r] = true; });
@@ -462,7 +510,10 @@
       Object.keys(groups).sort().forEach(function (key) {
         // Short legend names ("live" / "demo", the words of the region table's "Live R1" / "Demo R1") keep the legend
         // small; the Dash page writes the source out ("R-130_+30 (Replay demo)").
-        var g = groups[key], name = multiSource ? g[0].region_id + (g[0].source === "replay" ? " · demo" : " · live") : String(g[0].region_id);
+        var g = groups[key], id = String(g[0].region_id), box = boxText(id);
+        var name = multiSource ? box + (g[0].source === "replay" ? " · demo" : " · live") : box;
+        // The hover keeps the raw region id next to the box in words.
+        var hoverName = name + " (" + id + ")";
         // A window is stored only with 20 or more events above Mc, so hours without one are gaps: a null point
         // breaks the line there instead of drawing a straight line across a day without an estimate.
         var x = [], y = [], sigma = [], custom = [];
@@ -477,7 +528,7 @@
           x: x, y: y,
           error_y: { type: "data", array: sigma, visible: true },
           customdata: custom,
-          hovertemplate: "%{x}<br>b=%{y:.2f}<br>events above Mc=%{customdata[0]}<br>long-term b=%{customdata[1]:.2f}<extra>" + name + "</extra>",
+          hovertemplate: "%{x}<br>b=%{y:.2f}<br>events above Mc=%{customdata[0]}<br>long-term b=%{customdata[1]:.2f}<extra>" + hoverName + "</extra>",
         });
         var alerts = g.filter(function (b) { return b.is_alert; });
         if (alerts.length) {
@@ -488,7 +539,7 @@
             x: alerts.map(function (b) { return plotTime(b.window_end_ms); }),
             y: alerts.map(function (b) { return b.b_value; }),
             marker: { color: "#dc2626", size: 11, symbol: "circle-open", line: { width: 2 } },
-            hovertemplate: "b-value alert: |b − long-term b| > max(0.25, 2σ)<br>b=%{y:.2f}<extra>" + name + "</extra>",
+            hovertemplate: "b-value alert: |b − long-term b| > max(0.25, 2σ)<br>b=%{y:.2f}<extra>" + hoverName + "</extra>",
           });
           alertLegendShown = true;
         }
@@ -545,7 +596,11 @@
     // The aftershocks are all smaller events in the catalogue around the mainshock, so the expected number
     // has no lower magnitude of its own: it is of whatever magnitudes the network records there.
     box.appendChild(el("div", { text: "Expected aftershocks" + startText + " (of the magnitudes the catalogue records there): " +
-      fixed(f.next_hour, 2) + " in the next hour, " + fixed(f.next_six_hours, 2) + " in the next 6 hours" }));
+      fmtExpected(f.next_hour) + " in the next hour, " + fmtExpected(f.next_six_hours) + " in the next 6 hours" }));
+    if (f.aftershocks < FEW_AFTERSHOCKS) {
+      box.appendChild(el("div", { className: "chart-note", text: "Only " + f.aftershocks + " aftershocks are catalogued for this sequence, " +
+        "so the fit rests on little data; the replay demo shows a full sequence." }));
+    }
     if (!m.active) {
       box.appendChild(el("div", { className: "forecast-warning", text: "Inactive: more than 30 days before the latest event; this is its last forecast." }));
     } else if (isStale(f.start_ms, m.clock_ms, true)) {
@@ -639,19 +694,22 @@
     // The regions are built from the last 24 hours of data, whatever the time range above.
     var head = ["Region", "Source", "Centroid (lon, lat)", "Cells", "Radius", "Max z (last 24 h)", "Max 6 h count (last 24 h)", "Cell ids"];
     var multiSource = selectedSources().length > 1;
+    // On phones the Source and Cell ids columns go: the region name already says Live or Demo.
+    var phone = isPhone();
+    var keep = function (cells) { return phone ? cells.filter(function (_, i) { return i !== 1 && i !== 7; }) : cells; };
     var table = el("table", { id: "regions-table-content" }, [
-      el("thead", {}, [el("tr", {}, head.map(function (h) { return el("th", { text: h }); }))]),
+      el("thead", {}, [el("tr", {}, keep(head).map(function (h) { return el("th", { text: h }); }))]),
       el("tbody", {}, regions.map(function (r) {
-        return el("tr", {}, [
+        return el("tr", {}, keep([
           el("td", { text: regionName(r, multiSource) }),
           el("td", { text: sourceLabel(r.source) }),
           el("td", { text: fixed(r.centroid_lon, 2) + ", " + fixed(r.centroid_lat, 2) }),
-          el("td", { text: r.cell_count }),
+          el("td", { text: cellsText(r) }),
           el("td", { className: r.within_radius === false ? "radius-over" : "", text: radiusText(r) }),
           el("td", { text: isNum(r.max_z_score) ? fixed(r.max_z_score, 1) : "n/a" }),
           el("td", { text: r.max_event_count }),
           el("td", { className: "cells", text: r.cells || "" }),
-        ]);
+        ]));
       })),
     ]);
     box.appendChild(table);
@@ -673,6 +731,11 @@
       origin.appendChild(document.createTextNode("Code version: "));
       origin.appendChild(el("a", { href: REPO_URL + "/commit/" + meta.commit, text: meta.commit.slice(0, 7) }));
       origin.appendChild(document.createTextNode(". "));
+      // The Actions run that wrote this page: its log shows Kafka, Spark and PostgreSQL running.
+      if (typeof meta.run_url === "string" && meta.run_url.indexOf("https://github.com/") === 0) {
+        origin.appendChild(el("a", { href: meta.run_url, text: "Pipeline run log" }));
+        origin.appendChild(document.createTextNode(". "));
+      }
     }
     origin.appendChild(el("a", { href: REPO_URL, text: "Repository" }));
     origin.appendChild(document.createTextNode("."));
@@ -712,6 +775,17 @@
     var reasons = Object.keys(s.rejected.by_reason);
     if (!reasons.length) { body.appendChild(el("div", { className: "empty", text: "None (this is normal)." })); }
     else { body.appendChild(table2(["Reason", "Messages"], reasons.map(function (r) { return [r, s.rejected.by_reason[r]]; }))); }
+    drawStatusNote();
+  }
+
+  /* Why the status counts are higher than the cards above: they count every stored row. */
+  function drawStatusNote() {
+    var note = $("status-note"), declustered = D.mainshocks.declustered_counts, m = 0;
+    if (!declustered) { note.textContent = ""; return; }
+    Object.keys(declustered).forEach(function (src) { m += declustered[src]; });
+    note.textContent = "Why the status counts are higher than the cards above: " + thousands(D.openWindows) +
+      " windows were still open when the data was written (left out of the charts) and " + thousands(m) +
+      " events of M \u2265 5 belong to a larger event's sequence (declustered, no forecast of their own).";
   }
 
   function render() {
@@ -753,8 +827,8 @@
     var resizeTimer = null;
     window.addEventListener("resize", function () {
       clearTimeout(resizeTimer);
-      // Both charts change their layout at the 640 px phone width (map labels, b-value chart height and legend).
-      resizeTimer = setTimeout(function () { if (D) { drawMap(eventsInView(), anomalousCells(), activeRegions()); drawBvalues(bvalueWindows()); } }, 200);
+      // The page changes its layout at the 640 px phone width (map labels and colour bar, b-value chart, toolbars, regions table).
+      resizeTimer = setTimeout(function () { if (D) { drawMap(eventsInView(), anomalousCells(), activeRegions()); drawBvalues(bvalueWindows()); drawRegionsTable(activeRegions()); drawForecast(currentMainshock()); } }, 200);
     });
     if (!window.Plotly) {
       var err = $("load-error");

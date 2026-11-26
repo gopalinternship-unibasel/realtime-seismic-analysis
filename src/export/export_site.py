@@ -5,7 +5,7 @@
 It reads the same PostgreSQL as the dashboard (the POSTGRES_* settings; the connection URL and the
 mainshock and forecast queries come from src/dashboard/app.py) and writes, into DIR:
 
-    meta.json            generation time (UTC), commit, newest event per source, file list
+    meta.json            generation time (UTC), commit, Actions run address, newest event per source, file list
     events.json          every stored event (newest first), the map and the event count
     anomaly_windows.json flagged 6-hour windows per grid cell (the page groups them per cell)
     active_regions.json  the K-Means regions
@@ -222,6 +222,12 @@ def export_mainshocks(engine) -> dict:
         None,
         engine,
     )
+    # M >= 5 events that belong to a larger event's sequence: no mainshock of their own, no forecast.
+    declustered = dash.query_df(
+        "SELECT source, COUNT(*) AS n FROM mainshocks WHERE larger_event_id IS NOT NULL GROUP BY source",
+        None,
+        engine,
+    )
     return {
         # Same rule as is_stale() in app.py: stale when the forecast starts more than this many seconds
         # before its source's clock.
@@ -231,6 +237,7 @@ def export_mainshocks(engine) -> dict:
         "window_days": dash.AFTERSHOCK_WINDOW_DAYS,
         "min_aftershocks_for_p": dash.MIN_AFTERSHOCKS_FOR_P,
         "active_counts": {r.source: int(r.n) for r in counts.itertuples(index=False)},
+        "declustered_counts": {r.source: int(r.n) for r in declustered.itertuples(index=False)},
         "items": items,
     }
 
@@ -275,6 +282,14 @@ def export_status(engine) -> dict:
     }
 
 
+def run_url() -> str | None:
+    """Address of the GitHub Actions run that writes the page; None outside GitHub Actions."""
+    server, repo, run_id = (os.getenv(n) for n in ("GITHUB_SERVER_URL", "GITHUB_REPOSITORY", "GITHUB_RUN_ID"))
+    if not (server and repo and run_id):
+        return None
+    return f"{server.rstrip('/')}/{repo}/actions/runs/{run_id}"
+
+
 def export_meta(engine, events_total: int, events_exported: int, files: list[str]) -> dict:
     now = dash.query_df("SELECT now() AS now", None, engine)["now"].iloc[0]
     newest = dash.query_df(
@@ -284,6 +299,7 @@ def export_meta(engine, events_total: int, events_exported: int, files: list[str
         "schema_version": SCHEMA_VERSION,
         "generated_at": iso(now),
         "commit": os.getenv("GITHUB_SHA") or None,
+        "run_url": run_url(),
         "newest_event": {r.source: iso(r.newest) for r in newest.itertuples(index=False)},
         "events_total": events_total,
         "events_exported": events_exported,
